@@ -2,7 +2,7 @@ FROM archlinux:latest
 
 # This file is meant for hosting relays
 
-# Main ports
+# Main port
 EXPOSE 7777/tcp
 EXPOSE 7777/udp
 
@@ -24,7 +24,7 @@ RUN pacman -Syu --noconfirm archlinux-keyring && \
         mingw-w64-winpthreads && \
     pacman -Scc --noconfirm
 
-# Copy the project
+# Copy
 WORKDIR /opt/games/openol-relay
 COPY . .
 
