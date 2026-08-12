@@ -27,7 +27,7 @@ jobs:
       - name: Fix permissions
         run: chown -R builder:builder .
 
-      - name: Build Windows
+      - name: Build
         run: |
           sudo -u builder sh <<'EOF'
           set -e
@@ -39,7 +39,7 @@ jobs:
       - name: Upload artifact/s
         uses: actions/upload-artifact@v6
         with:
-          name: Launcher
+          name: OpenOL_Relay
           path: |
             src/build/OpenOL_Relay
             src/build/OpenOL_Relay_GUI
