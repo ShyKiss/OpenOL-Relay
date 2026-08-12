@@ -18,7 +18,7 @@ On the machine that will host the dedicated server, execute the following comman
 ```sh
 mkdir -p $HOME/Games/openol-relay
 git clone https://github.com/ShyKiss/openol-relay $HOME/Games/openol-relay
-cd $HOME/Games/openol-relay/Container
+cd $HOME/Games/openol-relay
 podman build --no-cache -t openol-relay:latest -f Container/Containerfile .
 ```
 

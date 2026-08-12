@@ -36,4 +36,4 @@ RUN cmake -S . -B build \
     cmake --build build
 
 # Start the relay
-CMD ["./build/OpenOL_Relay"]
+CMD ["/opt/games/openol-relay/src/build/OpenOL_Relay"]
