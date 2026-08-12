@@ -2,12 +2,9 @@ FROM archlinux:latest
 
 # This file is meant for hosting relays
 
-# Main port
+# Main ports
 EXPOSE 7777/tcp
 EXPOSE 7777/udp
-
-# Env vars
-ENV DEBIAN_FRONTEND=noninteractive
 
 # Dependencies
 RUN pacman -Syu --noconfirm archlinux-keyring && \
@@ -27,12 +24,16 @@ RUN pacman -Syu --noconfirm archlinux-keyring && \
         mingw-w64-winpthreads && \
     pacman -Scc --noconfirm
 
-WORKDIR /build
-
+# Copy the project
+WORKDIR /opt/games/openol-relay
 COPY . .
 
-RUN python3.12 -m venv .venv && \
-    . .venv/bin/activate && \
-    python3.12 -m pip install -r requirements.txt
+# Build
+WORKDIR /opt/games/openol-relay/src
 
-CMD ["python3.12", "OutlastTogether.py", "--headless", "--config server_config.json"]
+RUN cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build
+
+# Start the relay
+CMD ["./build/OpenOL_Relay"]

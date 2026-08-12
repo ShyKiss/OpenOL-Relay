@@ -16,10 +16,10 @@ Ensure the following dependencies are installed on your host:
 On the machine that will host the dedicated server, execute the following commands individually:
 
 ```sh
-mkdir -p $HOME/Games/OpenOL-Relay
-git clone https://github.com/ShyKiss/OpenOL-Relay $HOME/Games/OpenOL-Relay
-cd $HOME/Games/OpenOL-Relay/Container
-podman build --no-cache -t OpenOL-Relay:latest .
+mkdir -p $HOME/Games/openol-relay
+git clone https://github.com/ShyKiss/openol-relay $HOME/Games/openol-relay
+cd $HOME/Games/openol-relay/Container
+podman build --no-cache -t openol-relay:latest .
 ```
 
 ### Running the Container
@@ -28,22 +28,9 @@ Run the container with:
 
 ```sh
 podman run --replace -it \
-  --name OpenOL-Relay \
+  --name openol-relay \
   -p 7777:7777/tcp \
   -p 7777:7777/udp \
   -v "$HOME/Games:/opt/games" \
-  OpenOL-Relay:latest
-```
-
-Type exit once it gets into a shell.
-
-Start the container by running
-
-```sh
-podman start -ai OpenOL-Relay
-```
-
-To start your server, run:
-```sh
-entrypoint.sh
+  openol-relay:latest
 ```
