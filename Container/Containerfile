@@ -35,5 +35,8 @@ RUN cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build
 
+# relay.db (uncomment if you're going to use custom config)
+#COPY relay.db /opt/games/openol-relay/src/build
+
 # Start the relay
 CMD ["/opt/games/openol-relay/src/build/OpenOL_Relay"]

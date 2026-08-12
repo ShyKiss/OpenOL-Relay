@@ -24,6 +24,8 @@ podman build --no-cache -t openol-relay:latest -f Container/Containerfile .
 
 ### Running the Container
 
+Disclaimer: If you're gonna use a custom config put it into the root of this repository.
+
 Run the container with:
 
 ```sh
@@ -31,6 +33,5 @@ podman run --replace -it \
   --name openol-relay \
   -p 7777:7777/tcp \
   -p 7777:7777/udp \
-  -v "$HOME/Games:/opt/games" \
   openol-relay:latest
 ```
