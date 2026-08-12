@@ -1,0 +1,45 @@
+name: Build for Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install base dependencies
+        run: |
+          pacman -Syu --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm base-devel sudo git cmake extra-cmake-modules mingw-w64-binutils mingw-w64-crt mingw-w64-gcc mingw-w64-headers mingw-w64-winpthreads
+
+      - name: Create build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Fix permissions
+        run: chown -R builder:builder .
+
+      - name: Build Windows
+        run: |
+          sudo -u builder sh <<'EOF'
+          set -e
+          cd src
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=yes -DCMAKE_TOOLCHAIN_FILE=./toolchain-mingw.cmake
+          cmake --build build
+          EOF
+
+      - name: Upload artifact/s
+        uses: actions/upload-artifact@v6
+        with:
+          name: Launcher
+          path: |
+            src/build/OpenOL_Relay.exe
+            src/build/OpenOL_Relay_GUI.exe

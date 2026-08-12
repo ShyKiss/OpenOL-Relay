@@ -5,7 +5,7 @@
   <a href="./README_RU.md">🇷🇺 Русский</a>
 </p>
 
-<img src="https://github.com/Heawikk/OpenOL-Multiplayer-SC/blob/main/OpenOL_2.gif" width="100%">
+<img src="./docs/assets/OpenOL.webp" width="100%">
 
 TUI/GUI - Relay between [OpenOL](https://github.com/ShyKiss/OpenOL) clients — a modded client for the game Outlast.
 
