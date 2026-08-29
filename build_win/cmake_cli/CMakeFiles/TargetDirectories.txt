@@ -1,3 +1,0 @@
-Z:/Development/Src/Multiplayer/server/build_win/cmake_cli/CMakeFiles/OpenOL_Relay.dir
-Z:/Development/Src/Multiplayer/server/build_win/cmake_cli/CMakeFiles/edit_cache.dir
-Z:/Development/Src/Multiplayer/server/build_win/cmake_cli/CMakeFiles/rebuild_cache.dir

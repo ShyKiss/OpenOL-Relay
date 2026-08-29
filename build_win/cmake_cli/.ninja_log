@@ -1,6 +1,0 @@
-# ninja log v7
-11	283	8076416660359782	CMakeFiles/OpenOL_Relay.dir/db.c.obj	764383217ca8a3af
-72	684	8086726484583951	CMakeFiles/OpenOL_Relay.dir/cli.c.obj	6e007a242c767922
-70	829	8086726484563951	CMakeFiles/OpenOL_Relay.dir/main.cpp.obj	e476179ab5d4909
-30	952	8086869143500062	CMakeFiles/OpenOL_Relay.dir/server.c.obj	193ad80f0ffc9609
-952	1103	8086869152300085	OpenOL_Relay.exe	a2ecc18a223537eb

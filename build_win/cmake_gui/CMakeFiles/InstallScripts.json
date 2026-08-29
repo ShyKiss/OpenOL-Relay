@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

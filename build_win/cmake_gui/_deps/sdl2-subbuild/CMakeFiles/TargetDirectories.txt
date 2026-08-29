@@ -1,3 +1,0 @@
-Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-subbuild/CMakeFiles/sdl2-populate.dir
-Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-subbuild/CMakeFiles/edit_cache.dir
-Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-subbuild/CMakeFiles/rebuild_cache.dir
