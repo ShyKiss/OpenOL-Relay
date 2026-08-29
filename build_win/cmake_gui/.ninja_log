@@ -1,0 +1,20 @@
+# ninja log v7
+15	397	8076416684549862	CMakeFiles/OpenOL_Relay.dir/db.c.obj	764383217ca8a3af
+21	443	8076416684619863	CMakeFiles/OpenOL_Relay_GUI.dir/db.c.obj	a946e2edd7cb3614
+115	729	8086726511503987	CMakeFiles/OpenOL_Relay.dir/cli.c.obj	6e007a242c767922
+113	805	8086726511483987	CMakeFiles/OpenOL_Relay.dir/main.cpp.obj	e476179ab5d4909
+217	1142	8086869173020138	CMakeFiles/OpenOL_Relay.dir/server.c.obj	193ad80f0ffc9609
+120	926	8086726511553987	CMakeFiles/OpenOL_Relay_GUI.dir/cli.c.obj	ba18e0771a905323
+116	984	8086726511513987	CMakeFiles/OpenOL_Relay_GUI.dir/main.cpp.obj	d6fb4967621676f2
+219	1284	8086869173040138	CMakeFiles/OpenOL_Relay_GUI.dir/server.c.obj	c078fba9acb62c68
+1142	1341	8086869181850161	OpenOL_Relay.exe	a2ecc18a223537eb
+899	2296	8074661265953892	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/backends/imgui_impl_opengl3.cpp.obj	affcdde00a613410
+885	2591	8074661265833892	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/backends/imgui_impl_sdl2.cpp.obj	810a6fd146ef719b
+181	2505	8086807803718399	CMakeFiles/OpenOL_Relay_GUI.dir/gui_app.cpp.obj	f43bbb38eef4ba0d
+16	2884	8074692892145547	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/imgui_tables.cpp.obj	829c5aded61149eb
+15	4299	8074692892135547	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/imgui_draw.cpp.obj	e80e69977b3987f7
+18	5738	8074692892155547	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/imgui_widgets.cpp.obj	8f4ab12ca233f153
+13	7801	8074692892115546	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/imgui.cpp.obj	e736c56b27d735ec
+1284	1708	8086869183210164	OpenOL_Relay_GUI.exe	cb34c9c4877e29b3
+21	1777	8074692892195547	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/backends/imgui_impl_win32.cpp.obj	efca015ce9f02990
+416	2005	8074692895955575	CMakeFiles/OpenOL_Relay_GUI.dir/_deps/imgui-src/backends/imgui_impl_dx9.cpp.obj	684c269ee6344def

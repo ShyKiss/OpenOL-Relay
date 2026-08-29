@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=C:/msys64f/mingw64/bin/cmake.exe;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-subbuild/sdl2-populate-prefix/src/sdl2-populate-stamp/download-sdl2-populate.cmake;COMMAND;C:/msys64f/mingw64/bin/cmake.exe;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-subbuild/sdl2-populate-prefix/src/sdl2-populate-stamp/verify-sdl2-populate.cmake;COMMAND;C:/msys64f/mingw64/bin/cmake.exe;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-subbuild/sdl2-populate-prefix/src/sdl2-populate-stamp/extract-sdl2-populate.cmake
+source_dir=Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps/sdl2-src
+work_dir=Z:/Development/Src/Multiplayer/server/build_win/cmake_gui/_deps
+url(s)=https://github.com/libsdl-org/SDL/releases/download/release-2.32.8/SDL2-devel-2.32.8-mingw.tar.gz
+hash=SHA256=f590b3707689562483ded05bf15eaf0f5d33eb97f49d0fd3b894225fe17cc52b
+      no_extract=
+

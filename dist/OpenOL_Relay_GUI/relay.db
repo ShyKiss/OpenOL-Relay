@@ -1,0 +1,19 @@
+{
+  "config": {
+    "name": "OLServer",
+    "ip": "0.0.0.0",
+    "port": "7777",
+    "log_packets": "false"
+  },
+  "rooms": [
+    {
+      "code": "PUBLIC",
+      "password": "",
+      "trusted": [],
+      "bans": [
+      ]
+    }
+  ],
+  "bans": [
+  ]
+}

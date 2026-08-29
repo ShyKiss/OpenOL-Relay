@@ -171,9 +171,9 @@ static inline int snap_i16(const uint8_t *b, int off) {
 
 static SnapState decode_snap(const uint8_t *raw, int len) {
     SnapState s = {};
-    // raw[0]=0x01, raw[1..4]=player_id, payload starts at 5
-    if (len < 5 + 62) return s;
-    int o = 5; // skip type + player_id
+    // wire: [channel(1)][type(1)][player_id LE4][payload...]
+    if (len < 6 + 62) return s;
+    int o = 6; // skip channel + type + player_id
     s.loc_x     = snap_f32(raw, o); o += 4;
     s.loc_y     = snap_f32(raw, o); o += 4;
     s.loc_z     = snap_f32(raw, o); o += 4;
@@ -2095,12 +2095,18 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
                         panel_border = IM_COL32(200, 140, 40, 200);
                         snprintf(hdr_text, sizeof(hdr_text), "Pushable");
                         addrow("Key (X,Y,Z)", ps->key);
-                        // state_pkt: [type][pid4][KeyX4][KeyY4][KeyZ4][Disp*10004]
-                        if (ps->pkt_len >= 21) {
+                        // wire: [channel(1)][type(1)][pid(4)][KeyX(4)][KeyY(4)][KeyZ(4)][Disp*1000(4)][Seq(4)][bPushing(1)]
+                        // offsets:  0         1        2       6        10       14       18            22      26
+                        if (ps->pkt_len >= 27) {
                             const uint8_t *b = (const uint8_t*)ps->pkt;
-                            int disp_raw = (int)b[17] | ((int)b[18]<<8) |
-                                           ((int)b[19]<<16) | ((int)b[20]<<24);
+                            int disp_raw = (int)b[18] | ((int)b[19]<<8) |
+                                           ((int)b[20]<<16) | ((int)b[21]<<24);
+                            uint32_t seq = (uint32_t)b[22] | ((uint32_t)b[23]<<8) |
+                                           ((uint32_t)b[24]<<16) | ((uint32_t)b[25]<<24);
+                            int bpushing = (int)b[26];
                             addrowf("Displacement", disp_raw / 1000.f);
+                            addrowf("Seq",          (float)seq);
+                            addrow ("Pushing",      bpushing ? "yes" : "no");
                         }
                         const char *rc = (ps->room_idx >= 0 && ps->room_idx < s->n_rooms)
                                           ? s->rooms[ps->room_idx].code : "?";
