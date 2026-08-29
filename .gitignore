@@ -1,3 +1,5 @@
-build/
-dist/
-build_win/
+build/*
+dist/*
+build_win/*
+.gitignore
+build_win.sh
