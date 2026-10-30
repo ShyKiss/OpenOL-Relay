@@ -62,7 +62,6 @@
 #define PUSH_DENIED 0x02   /* [KeyX(4)][KeyY(4)][KeyZ(4)] (server->client, player_id=0) */
 
 /* CH_WORLD */
-#define WORLD_TRIGGER_ACT       0x01   /* [countLE(4)][pathLen(1)][path ASCII] */
 #define WORLD_ITEM_CONSUME      0x02   /* [pathLen(1)][item name ASCII] */
 #define WORLD_PICKUP_STATE      0x03   /* [X(4)][Y(4)][Z(4)] */
 #define WORLD_PICKUP_START      0x04   /* [X(4)][Y(4)][Z(4)] */
@@ -75,9 +74,8 @@
 #define WORLD_REQUEST_DOORS     0x0B   /* (no payload) */
 #define WORLD_REQUEST_PUSHABLES 0x0C   /* (no payload) */
 #define WORLD_MATINEE_STATE     0x0D   /* [count(1)] { [pathLen(1)][path][pos f32][rate f32] } * N */
-#define WORLD_TRIGGER_FIRE      0x0E   /* [subtype(1)][maxCount(1)][pathLen(1)][path ASCII] */
+#define WORLD_TRIGGER_FIRE      0x0E   /* [maxCount(1)][pathLen(1)][path] C->S request, S->C commit; player_id = instigator */
 #define WORLD_TRIGGER_DENIED    0x0F   /* [pathLen(1)][path ASCII] (server->client) */
-#define WORLD_REQUEST_TRIGGERS  0x10   /* (no payload) */
 
 /* CH_SESS. A world is one persistent level plus the current checkpoint; epoch
    changes whenever the world is restarted or replaced. Strings are [len(1)][ASCII]. */

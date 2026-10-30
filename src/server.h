@@ -116,6 +116,8 @@ static inline double mono_now() {
 #define MAX_ENEMY_NAME       48
 #define MAX_ENEMY_SNAP_DATA  512
 
+#define MAX_TRIGGERS         2048
+#define TRIGGER_REPEAT_WINDOW 0.25  // seconds: two players entering a repeatable trigger fire it once
 #define MAX_PICKUP_SNAPSHOTS 2048
 #define MAX_PICKUP_KEY       256  // PathName or "X,Y,Z"
 #define MAX_PICKUP_SNAP_DATA 320
@@ -249,6 +251,18 @@ typedef struct {
 } PickupSnapshot;
 
 // ---------------------------------------------------------------------------
+// Trigger state (per room) — the server decides whether a Kismet trigger fires
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint64_t path_hash;
+    int      room_idx;
+    int      used;
+    int      count;
+    double   last_fire;
+} TriggerState;
+
+// ---------------------------------------------------------------------------
 // Door snapshot (per room)
 // ---------------------------------------------------------------------------
 
@@ -324,6 +338,7 @@ typedef struct {
     PushSnapshot    pushables[MAX_PUSH_SNAPSHOTS];
     EnemySnapshot   enemies[MAX_ENEMY_SNAPSHOTS];
     PickupSnapshot  pickups[MAX_PICKUP_SNAPSHOTS];
+    TriggerState    triggers[MAX_TRIGGERS];
     double         next_heartbeat;
     double         next_timeout;
     double         next_snap_drain;

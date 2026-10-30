@@ -137,6 +137,9 @@ void server_clear_room_snapshots(Server *s, int room_idx) {
     for (int i = 0; i < MAX_PICKUP_SNAPSHOTS; i++)
         if (s->pickups[i].used && s->pickups[i].room_idx == room_idx)
             memset(&s->pickups[i], 0, sizeof(s->pickups[i]));
+    for (int i = 0; i < MAX_TRIGGERS; i++)
+        if (s->triggers[i].used && s->triggers[i].room_idx == room_idx)
+            memset(&s->triggers[i], 0, sizeof(s->triggers[i]));
 }
 
 int server_room_player_count(Server *s, int room_idx) {
@@ -531,7 +534,7 @@ void send_snapshots_to_newcomer(Server *s, Player *newcomer) {
     for (int i = 0; i < MAX_DOOR_SNAPSHOTS; i++) {
         DoorSnapshot *d = &s->doors[i];
         if (!d->used || d->room_idx != newcomer->room_idx) continue;
-        if (d->authority_player_id != 0 && d->lock_len > 0) {
+        if (d->authority_player_id != 0 && d->authority_player_id != newcomer->id && d->lock_len > 0) {
             Player *auth = server_find_player_by_id(s, d->authority_player_id);
             if (auth && auth->used)
                 server_snap_enqueue(newcomer, d->lock_pkt, d->lock_len);
@@ -875,6 +878,9 @@ static void session_join(Server *s, Player *pl) {
     Room *room = &s->rooms[pl->room_idx];
     unsigned char end[OL_HEADER_SIZE + 2];
     pl->in_world = 1;
+    // (Re)entering means the hero is not holding anything any more.
+    door_release_authority(s, pl->room_idx, pl->id);
+    push_release_owner(s, pl->room_idx, pl->id);
     send_world_msg(pl, SESS_WORLD, room);
     send_snapshots_to_newcomer(s, pl);
     memset(end, 0, sizeof(end));
@@ -1000,6 +1006,76 @@ static void handle_session(Server *s, Player *pl, unsigned char ptype, const cha
     }
 }
 
+// ---------------------------------------------------------------------------
+// Trigger arbiter
+// ---------------------------------------------------------------------------
+
+static TriggerState *trigger_find_or_alloc(Server *s, int room_idx, uint64_t hash) {
+    TriggerState *free_slot = NULL;
+    int i;
+    for (i = 0; i < MAX_TRIGGERS; i++) {
+        TriggerState *t = &s->triggers[i];
+        if (t->used) {
+            if (t->room_idx == room_idx && t->path_hash == hash) return t;
+        } else if (!free_slot) {
+            free_slot = t;
+        }
+    }
+    if (free_slot) {
+        free_slot->used = 1;
+        free_slot->room_idx = room_idx;
+        free_slot->path_hash = hash;
+        free_slot->count = 0;
+        free_slot->last_fire = 0.0;
+    }
+    return free_slot;
+}
+
+// [header][maxCount(1)][pathLen(1)][path]: fire for everyone or refuse the sender.
+static void handle_trigger_fire(Server *s, Player *pl, const char *data, int len) {
+    const unsigned char *u = (const unsigned char *)data;
+    TriggerState *t;
+    uint64_t hash = 1469598103934665603ULL;  /* FNV-1a */
+    double now = mono_now();
+    int i, path_len, allow = 1;
+
+    if (len < OL_HEADER_SIZE + 2) return;
+    path_len = u[OL_HEADER_SIZE + 1];
+    if (path_len == 0 || OL_HEADER_SIZE + 2 + path_len > len) return;
+    for (i = 0; i < path_len; i++) {
+        hash ^= u[OL_HEADER_SIZE + 2 + i];
+        hash *= 1099511628211ULL;
+    }
+
+    t = trigger_find_or_alloc(s, pl->room_idx, hash);
+    if (t) {  // table full: fail open rather than block the story
+        int max_count = u[OL_HEADER_SIZE];
+        if (max_count > 0 && t->count >= max_count) allow = 0;
+        if (max_count == 0 && t->count > 0 && now - t->last_fire < TRIGGER_REPEAT_WINDOW) allow = 0;
+        if (allow) {
+            t->count++;
+            t->last_fire = now;
+        }
+    }
+
+    if (allow) {
+        history_push(s, "[%s] Trigger %.*s", pl->nick, path_len > 80 ? 80 : path_len, data + OL_HEADER_SIZE + 2);
+        for (i = 0; i < MAX_CLIENTS; i++) {
+            Player *p = &s->players[i];
+            if (p->used && p->room_idx == pl->room_idx && p->in_world)
+                player_send(p, data, len);
+        }
+    } else {
+        unsigned char deny[OL_HEADER_SIZE + 1 + 255];
+        memset(deny, 0, OL_HEADER_SIZE);
+        deny[0] = CH_WORLD;
+        deny[1] = WORLD_TRIGGER_DENIED;
+        deny[OL_HEADER_SIZE] = (unsigned char)path_len;
+        memcpy(deny + OL_HEADER_SIZE + 1, data + OL_HEADER_SIZE + 2, path_len);
+        player_send(pl, (const char *)deny, OL_HEADER_SIZE + 1 + path_len);
+    }
+}
+
 static int read_i32(const char *p) {
     const unsigned char *b = (const unsigned char *)p;
     return (int)((uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
@@ -1075,6 +1151,10 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
             }
             if (ptype == WORLD_DISCONNECT) {
                 pl->pending_disconnect = 1;
+                return;
+            }
+            if (ptype == WORLD_TRIGGER_FIRE) {
+                handle_trigger_fire(s, pl, data, len);
                 return;
             }
             if (ptype == WORLD_REQUEST_ENEMIES) {
@@ -1340,16 +1420,6 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
                 }
                 default: break;
             }
-        } else if (channel == CH_WORLD && ptype == WORLD_TRIGGER_ACT) {
-            char path[128];
-            memset(path, 0, sizeof(path));
-            if (len >= 12) {
-                unsigned char slen = (unsigned char)data[10];
-                int ml = len - 11; if (slen > ml) slen = (unsigned char)ml;
-                if (slen > 127) slen = 127;
-                memcpy(path, data + 11, slen);
-            }
-            history_push(s, "[%s@%s] Trigger %s", pl->nick, room, path);
         }
 
         // Relay as-is — receivers parse the binary payload themselves
