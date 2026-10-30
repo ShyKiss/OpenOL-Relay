@@ -1,9 +1,8 @@
 /*=============================================================================
     openol_protocol.h - packet IDs shared by the game client and the relay.
 
-    This is the only place where packet numbers are defined. The standalone
-    relay keeps an identical copy in Multiplayer/server/src, verified by
-    Multiplayer/Tests/test_relay.py. Must stay valid C for the relay build.
+    This is the only place where packet numbers are defined. The game client
+    includes it through the OpenOL-Relay submodule. Must stay valid C.
 
     Client -> server:  [channel(1)][type(1)][player_id LE4][payload...]
     Server -> client:  relayed packets keep the layout above, with player_id
