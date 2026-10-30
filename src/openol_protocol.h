@@ -76,6 +76,14 @@
 #define WORLD_MATINEE_STATE     0x0D   /* [count(1)] { [pathLen(1)][path][pos f32][rate f32] } * N */
 #define WORLD_TRIGGER_FIRE      0x0E   /* [maxCount(1)][pathLen(1)][path] C->S request, S->C commit; player_id = instigator */
 #define WORLD_TRIGGER_DENIED    0x0F   /* [pathLen(1)][path ASCII] (server->client) */
+#define WORLD_CLAIM             0x10   /* [kind(1)][maxCount(1)][pathLen(1)][path] C->S request; S->C grant
+                                          with [count(1)] appended, player_id = claimant */
+#define WORLD_CLAIM_DENIED      0x11   /* [kind(1)][pathLen(1)][path] (server->client) */
+#define WORLD_CLAIM_RELEASE     0x12   /* [kind(1)][maxCount(1)][pathLen(1)][path] C->S: the granted action
+                                          could not start; S->C with [count(1)] appended */
+
+#define CLAIM_CSA    1
+#define CLAIM_PICKUP 2
 
 /* CH_SESS. A world is one persistent level plus the current checkpoint; epoch
    changes whenever the world is restarted or replaced. Strings are [len(1)][ASCII]. */

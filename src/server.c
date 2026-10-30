@@ -1031,40 +1031,56 @@ static TriggerState *trigger_find_or_alloc(Server *s, int room_idx, uint64_t has
     return free_slot;
 }
 
+// Decides one use of a limited world object. kind keeps triggers, CSAs and pickups
+// apart. Returns 1 and the new use count if the sender gets it.
+static uint64_t arbiter_hash(unsigned char kind, const unsigned char *path, int path_len) {
+    uint64_t hash = 1469598103934665603ULL ^ kind;  /* FNV-1a */
+    int i;
+    for (i = 0; i < path_len; i++) {
+        hash ^= path[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static int arbiter_allow(Server *s, Player *pl, unsigned char kind, int max_count,
+                         const unsigned char *path, int path_len, int *count) {
+    TriggerState *t;
+    double now = mono_now();
+
+    *count = 1;
+    t = trigger_find_or_alloc(s, pl->room_idx, arbiter_hash(kind, path, path_len));
+    if (!t) return 1;  // table full: fail open rather than block the story
+
+    if (max_count > 0 && t->count >= max_count) return 0;
+    if (max_count == 0 && t->count > 0 && now - t->last_fire < TRIGGER_REPEAT_WINDOW) return 0;
+    t->count++;
+    t->last_fire = now;
+    *count = t->count;
+    return 1;
+}
+
+static void send_to_world(Server *s, const Player *pl, const char *data, int len) {
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->room_idx == pl->room_idx && p->in_world)
+            player_send(p, data, len);
+    }
+}
+
 // [header][maxCount(1)][pathLen(1)][path]: fire for everyone or refuse the sender.
 static void handle_trigger_fire(Server *s, Player *pl, const char *data, int len) {
     const unsigned char *u = (const unsigned char *)data;
-    TriggerState *t;
-    uint64_t hash = 1469598103934665603ULL;  /* FNV-1a */
-    double now = mono_now();
-    int i, path_len, allow = 1;
+    int path_len, count;
 
     if (len < OL_HEADER_SIZE + 2) return;
     path_len = u[OL_HEADER_SIZE + 1];
     if (path_len == 0 || OL_HEADER_SIZE + 2 + path_len > len) return;
-    for (i = 0; i < path_len; i++) {
-        hash ^= u[OL_HEADER_SIZE + 2 + i];
-        hash *= 1099511628211ULL;
-    }
 
-    t = trigger_find_or_alloc(s, pl->room_idx, hash);
-    if (t) {  // table full: fail open rather than block the story
-        int max_count = u[OL_HEADER_SIZE];
-        if (max_count > 0 && t->count >= max_count) allow = 0;
-        if (max_count == 0 && t->count > 0 && now - t->last_fire < TRIGGER_REPEAT_WINDOW) allow = 0;
-        if (allow) {
-            t->count++;
-            t->last_fire = now;
-        }
-    }
-
-    if (allow) {
+    if (arbiter_allow(s, pl, 0, u[OL_HEADER_SIZE], u + OL_HEADER_SIZE + 2, path_len, &count)) {
         history_push(s, "[%s] Trigger %.*s", pl->nick, path_len > 80 ? 80 : path_len, data + OL_HEADER_SIZE + 2);
-        for (i = 0; i < MAX_CLIENTS; i++) {
-            Player *p = &s->players[i];
-            if (p->used && p->room_idx == pl->room_idx && p->in_world)
-                player_send(p, data, len);
-        }
+        send_to_world(s, pl, data, len);
     } else {
         unsigned char deny[OL_HEADER_SIZE + 1 + 255];
         memset(deny, 0, OL_HEADER_SIZE);
@@ -1074,6 +1090,57 @@ static void handle_trigger_fire(Server *s, Player *pl, const char *data, int len
         memcpy(deny + OL_HEADER_SIZE + 1, data + OL_HEADER_SIZE + 2, path_len);
         player_send(pl, (const char *)deny, OL_HEADER_SIZE + 1 + path_len);
     }
+}
+
+// [header][kind(1)][maxCount(1)][pathLen(1)][path]: the grant goes to everyone so losers
+// learn the object is used before they hear their own refusal.
+static void handle_claim(Server *s, Player *pl, const char *data, int len) {
+    const unsigned char *u = (const unsigned char *)data;
+    unsigned char out[OL_HEADER_SIZE + 3 + 255 + 1];
+    int path_len, count, msg_len;
+
+    if (len < OL_HEADER_SIZE + 3) return;
+    path_len = u[OL_HEADER_SIZE + 2];
+    if (path_len == 0 || OL_HEADER_SIZE + 3 + path_len > len) return;
+    if (u[OL_HEADER_SIZE] != CLAIM_CSA && u[OL_HEADER_SIZE] != CLAIM_PICKUP) return;
+
+    msg_len = OL_HEADER_SIZE + 3 + path_len;
+    if (arbiter_allow(s, pl, u[OL_HEADER_SIZE], u[OL_HEADER_SIZE + 1],
+                      u + OL_HEADER_SIZE + 3, path_len, &count)) {
+        memcpy(out, data, msg_len);
+        out[msg_len] = (unsigned char)(count > 255 ? 255 : count);
+        send_to_world(s, pl, (const char *)out, msg_len + 1);
+    } else {
+        memset(out, 0, OL_HEADER_SIZE);
+        out[0] = CH_WORLD;
+        out[1] = WORLD_CLAIM_DENIED;
+        out[OL_HEADER_SIZE] = u[OL_HEADER_SIZE];
+        out[OL_HEADER_SIZE + 1] = (unsigned char)path_len;
+        memcpy(out + OL_HEADER_SIZE + 2, u + OL_HEADER_SIZE + 3, path_len);
+        player_send(pl, (const char *)out, OL_HEADER_SIZE + 2 + path_len);
+    }
+}
+
+// Same layout as WORLD_CLAIM. The claimant could not start the granted action (the player
+// looked away while waiting), so it must become available again or a key item would be lost.
+static void handle_claim_release(Server *s, Player *pl, const char *data, int len) {
+    const unsigned char *u = (const unsigned char *)data;
+    unsigned char out[OL_HEADER_SIZE + 3 + 255 + 1];
+    TriggerState *t;
+    int path_len, msg_len;
+
+    if (len < OL_HEADER_SIZE + 3) return;
+    path_len = u[OL_HEADER_SIZE + 2];
+    if (path_len == 0 || OL_HEADER_SIZE + 3 + path_len > len) return;
+
+    t = trigger_find_or_alloc(s, pl->room_idx, arbiter_hash(u[OL_HEADER_SIZE], u + OL_HEADER_SIZE + 3, path_len));
+    if (!t) return;
+    if (t->count > 0) t->count--;
+
+    msg_len = OL_HEADER_SIZE + 3 + path_len;
+    memcpy(out, data, msg_len);
+    out[msg_len] = (unsigned char)(t->count > 255 ? 255 : t->count);
+    send_to_world(s, pl, (const char *)out, msg_len + 1);
 }
 
 static int read_i32(const char *p) {
@@ -1155,6 +1222,14 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
             }
             if (ptype == WORLD_TRIGGER_FIRE) {
                 handle_trigger_fire(s, pl, data, len);
+                return;
+            }
+            if (ptype == WORLD_CLAIM) {
+                handle_claim(s, pl, data, len);
+                return;
+            }
+            if (ptype == WORLD_CLAIM_RELEASE) {
+                handle_claim_release(s, pl, data, len);
                 return;
             }
             if (ptype == WORLD_REQUEST_ENEMIES) {
