@@ -56,6 +56,10 @@
 #define ENEMY_DOOR_DONE  0x06   /* [namelen(1)][name][FEnpcDoorBody] */
 #define ENEMY_DOOR_BASH  0x07   /* [namelen(1)][name][FEnpcDoorBashBody] */
 #define ENEMY_DOOR_BREAK 0x08   /* [namelen(1)][name][FEnpcDoorBashBody] */
+#define ENEMY_ANIM       0x09   /* [namelen(1)][name][flags(1)][slot][animset][anim][pos f32][rate f32]; strings are [len(1)][ASCII] */
+
+#define ENEMY_ANIM_STOP  0x01   /* stop the slot; pos and rate are not meaningful */
+#define ENEMY_ANIM_LOOP  0x02
 
 /* CH_PUSH */
 #define PUSH_STATE  0x01   /* FPushStatePacket */

@@ -237,6 +237,8 @@ typedef struct {
     int      smt_len;
     char     loc_pkt[MAX_ENEMY_SNAP_DATA];   // latest ENPC_LOC relay line
     int      loc_len;
+    char     anim_pkt[MAX_ENEMY_SNAP_DATA];  // animation playing right now (optional)
+    int      anim_len;
 } EnemySnapshot;
 
 // ---------------------------------------------------------------------------

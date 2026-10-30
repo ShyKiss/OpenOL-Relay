@@ -549,6 +549,7 @@ void send_snapshots_to_newcomer(Server *s, Player *newcomer) {
         if (e->owner_player_id == newcomer->id) continue;
         if (e->spawn_len > 0) server_snap_enqueue(newcomer, e->spawn_pkt, e->spawn_len);
         if (e->smt_len   > 0) server_snap_enqueue(newcomer, e->smt_pkt,   e->smt_len);
+        if (e->anim_len  > 0) server_snap_enqueue(newcomer, e->anim_pkt,  e->anim_len);
         if (e->loc_len   > 0) server_snap_enqueue(newcomer, e->loc_pkt,   e->loc_len);
     }
     // Pushable snapshots — always send with bPushing=0 (offset 26) so newcomers
@@ -1335,6 +1336,7 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
                     if (e->owner_player_id == pl->id) continue;
                     if (e->spawn_len > 0) server_snap_enqueue(pl, e->spawn_pkt, e->spawn_len);
                     if (e->smt_len > 0)   server_snap_enqueue(pl, e->smt_pkt,   e->smt_len);
+                    if (e->anim_len > 0)  server_snap_enqueue(pl, e->anim_pkt,  e->anim_len);
                     if (e->loc_len > 0)   server_snap_enqueue(pl, e->loc_pkt,   e->loc_len);
                 }
                 return;
@@ -1505,9 +1507,21 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
                     e->spawn_len = store;
                     e->smt_len = 0;
                     e->loc_len = 0;
+                    e->anim_len = 0;
                 }
             } else if (ptype == ENEMY_DEL) {
                 enemy_remove(s, pl->room_idx, ename);
+            } else if (ptype == ENEMY_ANIM) {
+                EnemySnapshot *e = enemy_find(s, pl->room_idx, ename);
+                int flags_off = 7 + nlen;
+                if (e && flags_off < len) {
+                    if (data[flags_off] & ENEMY_ANIM_STOP) {
+                        e->anim_len = 0;
+                    } else if (len <= MAX_ENEMY_SNAP_DATA) {
+                        memcpy(e->anim_pkt, data, len);
+                        e->anim_len = len;
+                    }
+                }
             } else if (ptype == ENEMY_SMT) {
                 int smt_off = 7 + nlen;
                 unsigned char smt_type = (smt_off < len) ? (unsigned char)data[smt_off] : 0;
