@@ -48,7 +48,7 @@
 #define DOOR_DENY    0x08   /* FDoorDenyPacket (server->client) */
 
 /* CH_ENEMY */
-#define ENEMY_SPAWN      0x01   /* [namelen(1)][name][classlen(1)][class][X][Y][Z][Yaw]... */
+#define ENEMY_SPAWN      0x01   /* [namelen(1)][name][classlen(1)][class][X][Y][Z][Yaw][mesh][weapon][color?][behaviorTree][voAsset] */
 #define ENEMY_DEL        0x02   /* [namelen(1)][name] */
 #define ENEMY_SMT        0x03   /* [namelen(1)][name][FEnpcSmtBody] */
 #define ENEMY_LOC        0x04   /* [namelen(1)][name][0][X][Y][Z][Yaw]... */
@@ -60,6 +60,7 @@
 
 #define ENEMY_ANIM_STOP  0x01   /* stop the slot; pos and rate are not meaningful */
 #define ENEMY_ANIM_LOOP  0x02
+#define ENEMY_ANIM_ROOT  0x04   /* the owner moves the actor from the root bone: the receiver must not */
 
 /* CH_PUSH */
 #define PUSH_STATE  0x01   /* FPushStatePacket */
