@@ -1212,9 +1212,32 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
         // CH_WORLD: special types
         if (channel == CH_WORLD) {
             if (ptype == WORLD_MATINEE_STATE) {
+                // Only for joining players: a running game starts matinees through triggers.
+                // A count of 0 means nothing is playing any more.
                 int snap_len = len < (int)sizeof(pl->matinee_snap) ? len : (int)sizeof(pl->matinee_snap);
-                memcpy(pl->matinee_snap, data, snap_len);
-                pl->matinee_snap_len = snap_len;
+                if (len > OL_HEADER_SIZE && data[OL_HEADER_SIZE] != 0) {
+                    memcpy(pl->matinee_snap, data, snap_len);
+                    pl->matinee_snap_len = snap_len;
+                } else {
+                    pl->matinee_snap_len = 0;
+                }
+                return;
+            }
+            if (ptype == WORLD_ITEM_CONSUME && len > OL_HEADER_SIZE + 1) {
+                // Replayed after the pickups, so a returning player does not keep a used item.
+                int name_len = (unsigned char)data[OL_HEADER_SIZE];
+                if (OL_HEADER_SIZE + 1 + name_len <= len && name_len + 9 < MAX_PICKUP_KEY) {
+                    char key[MAX_PICKUP_KEY];
+                    PickupSnapshot *p;
+                    memcpy(key, "consume:", 8);
+                    memcpy(key + 8, data + OL_HEADER_SIZE + 1, name_len);
+                    key[8 + name_len] = '\0';
+                    p = pickup_alloc(s, pl->room_idx, key);
+                    if (p && len <= MAX_PICKUP_SNAP_DATA) {
+                        memcpy(p->pkt, data, len);
+                        p->pkt_len = len;
+                    }
+                }
             }
             if (ptype == WORLD_DISCONNECT) {
                 pl->pending_disconnect = 1;
