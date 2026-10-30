@@ -96,6 +96,7 @@ static inline double mono_now() {
 #define MAX_NICK        33
 #define MAX_PASSWORD    64
 #define MAX_IP          46      // IPv6 max
+#define MAX_WORLD_NAME  128
 
 #define DEFAULT_PORT    7777
 #define DEFAULT_IP      "0.0.0.0"
@@ -199,6 +200,10 @@ typedef struct {
     char     code[MAX_ROOM_CODE];
     char     password[MAX_PASSWORD];
     int      active;
+    // The current world, empty while nobody has entered one.
+    char     world_persist[MAX_WORLD_NAME];
+    char     world_cp[MAX_WORLD_NAME];
+    uint16_t epoch;
 } Room;
 
 // ---------------------------------------------------------------------------
@@ -297,6 +302,7 @@ typedef struct {
     uint8_t  session_token[32];
     OlConn   conn;
     int      pending_disconnect;  // set while a datagram is being processed
+    int      in_world;            // receives and sends world traffic
 } Player;
 
 // ---------------------------------------------------------------------------

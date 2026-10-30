@@ -20,6 +20,8 @@
 #define CH_ENEMY 0x03   /* Enemy NPC */
 #define CH_PUSH  0x04   /* Pushable objects */
 #define CH_WORLD 0x05   /* World events, pickups, triggers, matinees */
+#define CH_SESS  0x06   /* Session: which world a player is in */
+#define OL_CHANNEL_MAX CH_SESS
 
 /* CH_SRV */
 #define SRV_HELLO  0x01   /* [nickLen(1)][nick ASCII] */
@@ -44,7 +46,6 @@
 #define DOOR_ANGLE   0x06   /* FDoorAnglePacket */
 #define DOOR_PARAMS  0x07   /* FDoorParamsPacket */
 #define DOOR_DENY    0x08   /* FDoorDenyPacket (server->client) */
-#define DOOR_INIT    0x09   /* FDoorAnglePacket (first-write-wins registration) */
 
 /* CH_ENEMY */
 #define ENEMY_SPAWN      0x01   /* [namelen(1)][name][classlen(1)][class][X][Y][Z][Yaw]... */
@@ -59,7 +60,6 @@
 /* CH_PUSH */
 #define PUSH_STATE  0x01   /* FPushStatePacket */
 #define PUSH_DENIED 0x02   /* [KeyX(4)][KeyY(4)][KeyZ(4)] (server->client, player_id=0) */
-#define PUSH_INIT   0x03   /* FPushStatePacket (first-write-wins, never relayed) */
 
 /* CH_WORLD */
 #define WORLD_TRIGGER_ACT       0x01   /* [countLE(4)][pathLen(1)][path ASCII] */
@@ -78,6 +78,18 @@
 #define WORLD_TRIGGER_FIRE      0x0E   /* [subtype(1)][maxCount(1)][pathLen(1)][path ASCII] */
 #define WORLD_TRIGGER_DENIED    0x0F   /* [pathLen(1)][path ASCII] (server->client) */
 #define WORLD_REQUEST_TRIGGERS  0x10   /* (no payload) */
+
+/* CH_SESS. A world is one persistent level plus the current checkpoint; epoch
+   changes whenever the world is restarted or replaced. Strings are [len(1)][ASCII]. */
+#define SESS_ENTER        0x01   /* C->S [epoch LE2][flags(1)][cp][persist] */
+#define SESS_CHECKPOINT   0x02   /* C->S [cp][persist] - checkpoint reached */
+#define SESS_LEAVE        0x03   /* C->S (no payload) - left the game world */
+#define SESS_TRAVEL       0x04   /* S->C [epoch LE2][cp][persist] - go to this world */
+#define SESS_WORLD        0x05   /* S->C [epoch LE2][cp][persist] - you are in this world */
+#define SESS_BASELINE_END 0x06   /* S->C [epoch LE2] - all world snapshots were sent */
+#define SESS_PLAYER_LEFT  0x07   /* S->C [player_id LE4] - player left the world */
+
+#define SESS_ENTER_RESET  0x01   /* restart the world at this checkpoint */
 
 /* Server -> client notifications */
 #define SRV_READY        0xE0   /* [player_id LE(4)][name_len(1)][name ASCII][token(32)] */

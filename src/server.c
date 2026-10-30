@@ -211,7 +211,7 @@ static void server_send_raw(Server *s, const Addr *addr, const char *msg, int le
 
 static void player_send(Player *p, const char *msg, int len) {
     int lane = OL_LANE_RELIABLE;
-    if (len >= 2 && (unsigned char)msg[0] <= CH_WORLD)
+    if (len >= 2 && (unsigned char)msg[0] <= OL_CHANNEL_MAX)
         lane = ol_lane_for((uint8_t)msg[0], (uint8_t)msg[1]);
     ol_conn_send(&p->conn, lane, msg, len);
 }
@@ -226,8 +226,8 @@ void server_relay(Server *s, Player *sender, const char *payload, int len) {
     int room_idx = sender->room_idx;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Player *p = &s->players[i];
-        if (p->used && p != sender && p->room_idx == room_idx)
-            server_send(s, &p->addr, payload, len);
+        if (p->used && p != sender && p->room_idx == room_idx && p->in_world)
+            player_send(p, payload, len);
     }
 }
 
@@ -520,7 +520,7 @@ void send_snapshots_to_newcomer(Server *s, Player *newcomer) {
     // Player state snapshots (binary STATE packets from other players)
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Player *p = &s->players[i];
-        if (!p->used || p == newcomer || p->room_idx != newcomer->room_idx)
+        if (!p->used || p == newcomer || p->room_idx != newcomer->room_idx || !p->in_world)
             continue;
         if (p->state_snap_len > 0)
             server_snap_enqueue(newcomer, (const char *)p->state_snap, p->state_snap_len);
@@ -601,8 +601,12 @@ void server_disconnect(Server *s, Player *p) {
     broadcast_online_count(s, room_idx, count);
 
     // Clear all snapshots when the room becomes empty
-    if (count == 0)
+    if (count == 0) {
+        Room *room = &s->rooms[room_idx];
         server_clear_room_snapshots(s, room_idx);
+        room->world_persist[0] = '\0';
+        room->world_cp[0] = '\0';
+    }
 
     server_log(s, "[%s] ID=%d ('%s') disconnected (%d left in room)", ip, pid, nick, count);
     history_push(s, "[%s] disconnected", nick);
@@ -768,8 +772,8 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
         ol_conn_reset(&pl->conn, gen_conn_id());
         send_ready(s, addr, pl->id, pl->session_token, pl->conn.conn_id);
         send_online_count(s, addr, count);
-        // Resend snapshots so reconnecting player gets up-to-date world state
-        send_snapshots_to_newcomer(s, pl);
+        // The client reports its world next (SESS_ENTER) and gets the snapshots then.
+        pl->in_world = 0;
         return;
     }
 
@@ -810,14 +814,191 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
 
     send_ready(s, addr, pl->id, pl->session_token, pl->conn.conn_id);
     send_online_count(s, addr, count);
-
-    // Send existing player and door state snapshots so the newcomer is in sync
-    send_snapshots_to_newcomer(s, pl);
 }
 
 // ---------------------------------------------------------------------------
 // Packet dispatch
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Session: which world each player is in
+// ---------------------------------------------------------------------------
+
+// Lengths include what fits in MAX_WORLD_NAME; returns the new offset or -1 if malformed.
+static int read_world_str(const char *data, int len, int off, char out[MAX_WORLD_NAME]) {
+    int n;
+    if (off >= len) return -1;
+    n = (unsigned char)data[off++];
+    if (n >= MAX_WORLD_NAME || off + n > len) return -1;
+    memcpy(out, data + off, n);
+    out[n] = '\0';
+    return off + n;
+}
+
+static int world_name_eq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return 0;
+    }
+    return *a == *b;
+}
+
+static int write_world_msg(unsigned char *buf, unsigned char type, const Room *room) {
+    int n = OL_HEADER_SIZE, cp_len = (int)strlen(room->world_cp), persist_len = (int)strlen(room->world_persist);
+    memset(buf, 0, OL_HEADER_SIZE);
+    buf[0] = CH_SESS;
+    buf[1] = type;
+    buf[n++] = (unsigned char)(room->epoch & 0xFF);
+    buf[n++] = (unsigned char)(room->epoch >> 8);
+    buf[n++] = (unsigned char)cp_len;
+    memcpy(buf + n, room->world_cp, cp_len);
+    n += cp_len;
+    buf[n++] = (unsigned char)persist_len;
+    memcpy(buf + n, room->world_persist, persist_len);
+    return n + persist_len;
+}
+
+static void send_world_msg(Player *p, unsigned char type, const Room *room) {
+    unsigned char buf[OL_HEADER_SIZE + 4 + 2 * MAX_WORLD_NAME];
+    player_send(p, (const char *)buf, write_world_msg(buf, type, room));
+}
+
+static void player_clear_world_snaps(Player *p) {
+    p->state_snap_len = 0;
+    p->matinee_snap_len = 0;
+    p->snap_head = 0;
+    p->snap_tail = 0;
+}
+
+static void session_join(Server *s, Player *pl) {
+    Room *room = &s->rooms[pl->room_idx];
+    unsigned char end[OL_HEADER_SIZE + 2];
+    pl->in_world = 1;
+    send_world_msg(pl, SESS_WORLD, room);
+    send_snapshots_to_newcomer(s, pl);
+    memset(end, 0, sizeof(end));
+    end[0] = CH_SESS;
+    end[1] = SESS_BASELINE_END;
+    end[OL_HEADER_SIZE] = (unsigned char)(room->epoch & 0xFF);
+    end[OL_HEADER_SIZE + 1] = (unsigned char)(room->epoch >> 8);
+    server_snap_enqueue(pl, (const char *)end, sizeof(end));
+}
+
+// Replaces the world: everything known about the old one is dropped and all other
+// players are told to follow. The new epoch makes their late packets harmless.
+static void session_new_world(Server *s, Player *pl, const char *cp, const char *persist) {
+    Room *room = &s->rooms[pl->room_idx];
+    int i;
+    server_clear_room_snapshots(s, pl->room_idx);
+    strncpy(room->world_cp, cp, MAX_WORLD_NAME - 1);
+    room->world_cp[MAX_WORLD_NAME - 1] = '\0';
+    strncpy(room->world_persist, persist, MAX_WORLD_NAME - 1);
+    room->world_persist[MAX_WORLD_NAME - 1] = '\0';
+    if (++room->epoch == 0) room->epoch = 1;
+    server_log(s, "Room '%s' world: %s cp=%s epoch=%d", room->code, persist, cp, (int)room->epoch);
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (!p->used || p->room_idx != pl->room_idx) continue;
+        player_clear_world_snaps(p);
+        if (p != pl) {
+            p->in_world = 0;
+            send_world_msg(p, SESS_TRAVEL, room);
+        }
+    }
+    session_join(s, pl);
+}
+
+static int session_others_in_world(const Server *s, const Player *pl) {
+    int i, n = 0;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        const Player *p = &s->players[i];
+        if (p->used && p != pl && p->room_idx == pl->room_idx && p->in_world) n++;
+    }
+    return n;
+}
+
+static void session_enter(Server *s, Player *pl, const char *data, int len) {
+    Room *room = &s->rooms[pl->room_idx];
+    char cp[MAX_WORLD_NAME], persist[MAX_WORLD_NAME];
+    int off = OL_HEADER_SIZE + 3, others;
+    uint16_t epoch;
+    unsigned char flags;
+
+    if (len < off) return;
+    epoch = (uint16_t)((unsigned char)data[OL_HEADER_SIZE] | ((unsigned char)data[OL_HEADER_SIZE + 1] << 8));
+    flags = (unsigned char)data[OL_HEADER_SIZE + 2];
+    off = read_world_str(data, len, off, cp);
+    if (off < 0) return;
+    off = read_world_str(data, len, off, persist);
+    if (off < 0 || !persist[0]) return;
+
+    others = session_others_in_world(s, pl);
+    if (!room->world_persist[0]
+        || (others == 0 && !world_name_eq(persist, room->world_persist))
+        || ((flags & SESS_ENTER_RESET) && (epoch != 0 || others == 0))) {
+        session_new_world(s, pl, cp, persist);
+    } else if (world_name_eq(persist, room->world_persist) || epoch == room->epoch) {
+        session_join(s, pl);
+    } else if (epoch == 0) {
+        // A fresh connection joins the running world instead of replacing it.
+        pl->in_world = 0;
+        send_world_msg(pl, SESS_TRAVEL, room);
+    }
+    // Otherwise the client is behind: its SESS_TRAVEL is already on the way.
+}
+
+static void session_checkpoint(Server *s, Player *pl, const char *data, int len) {
+    Room *room = &s->rooms[pl->room_idx];
+    char cp[MAX_WORLD_NAME], persist[MAX_WORLD_NAME];
+    int off = read_world_str(data, len, OL_HEADER_SIZE, cp);
+    if (off < 0 || !pl->in_world) return;
+    off = read_world_str(data, len, off, persist);
+    if (off < 0 || !persist[0]) return;
+
+    if (world_name_eq(persist, room->world_persist)) {
+        strncpy(room->world_cp, cp, MAX_WORLD_NAME - 1);
+        room->world_cp[MAX_WORLD_NAME - 1] = '\0';
+    } else {
+        session_new_world(s, pl, cp, persist);
+    }
+}
+
+static void notify_player_left(Server *s, const Player *pl) {
+    unsigned char msg[OL_HEADER_SIZE + 4];
+    int i;
+    memset(msg, 0, sizeof(msg));
+    msg[0] = CH_SESS;
+    msg[1] = SESS_PLAYER_LEFT;
+    msg[OL_HEADER_SIZE]     = (unsigned char)(pl->id & 0xFF);
+    msg[OL_HEADER_SIZE + 1] = (unsigned char)((pl->id >> 8) & 0xFF);
+    msg[OL_HEADER_SIZE + 2] = (unsigned char)((pl->id >> 16) & 0xFF);
+    msg[OL_HEADER_SIZE + 3] = (unsigned char)((pl->id >> 24) & 0xFF);
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p != pl && p->room_idx == pl->room_idx)
+            player_send(p, (const char *)msg, sizeof(msg));
+    }
+}
+
+static void session_leave(Server *s, Player *pl) {
+    if (!pl->in_world) return;
+    pl->in_world = 0;
+    door_release_authority(s, pl->room_idx, pl->id);
+    push_release_owner(s, pl->room_idx, pl->id);
+    enemy_remove_all_for_player(s, pl->room_idx, pl->id);
+    player_clear_world_snaps(pl);
+    notify_player_left(s, pl);
+}
+
+static void handle_session(Server *s, Player *pl, unsigned char ptype, const char *data, int len) {
+    switch (ptype) {
+        case SESS_ENTER:      session_enter(s, pl, data, len); break;
+        case SESS_CHECKPOINT: session_checkpoint(s, pl, data, len); break;
+        case SESS_LEAVE:      session_leave(s, pl); break;
+        default: break;
+    }
+}
 
 static int read_i32(const char *p) {
     const unsigned char *b = (const unsigned char *)p;
@@ -829,7 +1010,7 @@ static int read_i32(const char *p) {
 static void handle_message(Server *s, Player *pl, char *data, int len) {
     const Addr *addr = &pl->addr;
     if (pl->pending_disconnect) return;
-    if (len >= 6 && (unsigned char)data[0] <= CH_WORLD) {
+    if (len >= 6 && (unsigned char)data[0] <= OL_CHANNEL_MAX) {
         unsigned char channel, ptype;
         int sender_slot;
         const char *room;
@@ -841,6 +1022,15 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
         data[4] = (char)((pl->id >> 16) & 0xFF);
         data[5] = (char)((pl->id >> 24) & 0xFF);
         if (!check_rate(pl)) return;
+
+        if (channel == CH_SESS) {
+            handle_session(s, pl, ptype, data, len);
+            return;
+        }
+        // World traffic only flows between players in the current world.
+        if (channel != CH_SRV && !pl->in_world
+            && !(channel == CH_WORLD && ptype == WORLD_DISCONNECT))
+            return;
 
         // CH_SRV: HELLO and PING
         if (channel == CH_SRV) {
@@ -933,18 +1123,7 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
             char key[MAX_DOOR_KEY];
             snprintf(key, sizeof(key), "%d,%d,%d", dx, dy, dz);
 
-            if (ptype == DOOR_INIT) {
-                if (!door_find(s, pl->room_idx, key)) {
-                    DoorSnapshot *d = door_alloc(s, pl->room_idx, key);
-                    if (d) {
-                        int store = len < MAX_DOOR_SNAP_DATA ? len : MAX_DOOR_SNAP_DATA - 1;
-                        memcpy(d->angle_pkt, data, store);
-                        d->angle_pkt[1] = DOOR_ANGLE; // rewrite type byte for replay
-                        d->angle_len = store;
-                    }
-                }
-                return;
-            } else if (ptype == DOOR_LOCK) {
+            if (ptype == DOOR_LOCK) {
                 DoorSnapshot *d = door_find(s, pl->room_idx, key);
                 if (d && d->authority_player_id != 0 && d->authority_player_id != pl->id) {
                     send_door_deny(s, &pl->addr, key);
@@ -986,27 +1165,6 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
                     d->angle_len = store;
                 }
             }
-        }
-
-        // CH_PUSH: pushable init snapshot — first-write-wins, never relayed.
-        // Sent by BroadcastPushableStates to register initial positions on server.
-        if (channel == CH_PUSH && ptype == PUSH_INIT && len >= 27) {
-            int px = read_i32(data + 6);
-            int py = read_i32(data + 10);
-            int pz = read_i32(data + 14);
-            char pkey[MAX_PUSH_KEY];
-            snprintf(pkey, sizeof(pkey), "%d,%d,%d", px, py, pz);
-            if (!push_find(s, pl->room_idx, pkey)) {
-                PushSnapshot *ps = push_alloc(s, pl->room_idx, pkey);
-                if (ps) {
-                    int store = len < MAX_PUSH_SNAP_DATA ? len : MAX_PUSH_SNAP_DATA - 1;
-                    memcpy(ps->pkt, data, store);
-                    ps->pkt_len = store;
-                    /* rewrite as PUSH_STATE so clients handle it correctly on replay */
-                    ps->pkt[1] = PUSH_STATE;
-                }
-            }
-            return; /* never relay PUSH_INIT */
         }
 
         // CH_PUSH: pushable snapshot — payload at data[6+]: [KeyX(4)][KeyY(4)][KeyZ(4)][DispX1000(4)][Seq(4)][bPushing(1)]
