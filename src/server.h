@@ -206,6 +206,7 @@ typedef struct {
     char     world_persist[MAX_WORLD_NAME];
     char     world_cp[MAX_WORLD_NAME];
     uint16_t epoch;
+    int      sim_owner;  // player_id of the client running enemy AI, 0 = none
 } Room;
 
 // ---------------------------------------------------------------------------

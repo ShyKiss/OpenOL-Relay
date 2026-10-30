@@ -575,6 +575,49 @@ void send_snapshots_to_newcomer(Server *s, Player *newcomer) {
 }
 
 // ---------------------------------------------------------------------------
+// Enemy AI authority: exactly one client in a room simulates enemies
+// ---------------------------------------------------------------------------
+
+static void send_sim_owner(Player *p, int owner_id) {
+    unsigned char msg[OL_HEADER_SIZE + 4];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = CH_SESS;
+    msg[1] = SESS_SIM_OWNER;
+    msg[OL_HEADER_SIZE]     = (unsigned char)(owner_id & 0xFF);
+    msg[OL_HEADER_SIZE + 1] = (unsigned char)((owner_id >> 8) & 0xFF);
+    msg[OL_HEADER_SIZE + 2] = (unsigned char)((owner_id >> 16) & 0xFF);
+    msg[OL_HEADER_SIZE + 3] = (unsigned char)((owner_id >> 24) & 0xFF);
+    player_send(p, (const char *)msg, sizeof(msg));
+}
+
+static void sim_set_owner(Server *s, int room_idx, int new_owner) {
+    Room *room = &s->rooms[room_idx];
+    int i;
+    if (room->sim_owner == new_owner) return;
+    // The old owner's enemies stop existing here; the new owner announces its own.
+    if (room->sim_owner != 0)
+        enemy_remove_all_for_player(s, room_idx, room->sim_owner);
+    room->sim_owner = new_owner;
+    server_log(s, "Room '%s' enemy AI owner: %d", room->code, new_owner);
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->room_idx == room_idx)
+            send_sim_owner(p, new_owner);
+    }
+}
+
+// Another player in the world who can take over from exclude_id, or 0.
+static int sim_next_owner(const Server *s, int room_idx, int exclude_id) {
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        const Player *p = &s->players[i];
+        if (p->used && p->room_idx == room_idx && p->in_world && p->id != exclude_id)
+            return p->id;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Disconnect
 // ---------------------------------------------------------------------------
 
@@ -585,6 +628,9 @@ void server_disconnect(Server *s, Player *p) {
     char nick[MAX_NICK];
     strncpy(ip,   p->ip,   sizeof(ip)   - 1); ip[sizeof(ip)-1]     = '\0';
     strncpy(nick, p->nick, sizeof(nick) - 1); nick[sizeof(nick)-1] = '\0';
+
+    if (s->rooms[room_idx].sim_owner == pid)
+        sim_set_owner(s, room_idx, sim_next_owner(s, room_idx, pid));
 
     // Release any door authority this player held
     door_release_authority(s, room_idx, pid);
@@ -775,6 +821,8 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
         ol_conn_reset(&pl->conn, gen_conn_id());
         send_ready(s, addr, pl->id, pl->session_token, pl->conn.conn_id);
         send_online_count(s, addr, count);
+        if (room->sim_owner != 0)
+            send_sim_owner(pl, room->sim_owner);
         // The client reports its world next (SESS_ENTER) and gets the snapshots then.
         pl->in_world = 0;
         return;
@@ -817,6 +865,9 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
 
     send_ready(s, addr, pl->id, pl->session_token, pl->conn.conn_id);
     send_online_count(s, addr, count);
+    // Known before the client loads a map, so it does not spawn enemies of its own.
+    if (room->sim_owner != 0)
+        send_sim_owner(pl, room->sim_owner);
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +929,10 @@ static void session_join(Server *s, Player *pl) {
     Room *room = &s->rooms[pl->room_idx];
     unsigned char end[OL_HEADER_SIZE + 2];
     pl->in_world = 1;
+    if (room->sim_owner == 0)
+        sim_set_owner(s, pl->room_idx, pl->id);
+    else
+        send_sim_owner(pl, room->sim_owner);
     // (Re)entering means the hero is not holding anything any more.
     door_release_authority(s, pl->room_idx, pl->id);
     push_release_owner(s, pl->room_idx, pl->id);
@@ -990,6 +1045,8 @@ static void notify_player_left(Server *s, const Player *pl) {
 static void session_leave(Server *s, Player *pl) {
     if (!pl->in_world) return;
     pl->in_world = 0;
+    if (s->rooms[pl->room_idx].sim_owner == pl->id)
+        sim_set_owner(s, pl->room_idx, sim_next_owner(s, pl->room_idx, pl->id));
     door_release_authority(s, pl->room_idx, pl->id);
     push_release_owner(s, pl->room_idx, pl->id);
     enemy_remove_all_for_player(s, pl->room_idx, pl->id);
@@ -1174,6 +1231,21 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
         if (channel != CH_SRV && !pl->in_world
             && !(channel == CH_WORLD && ptype == WORLD_DISCONNECT))
             return;
+
+        {
+            Room *sim_room = &s->rooms[pl->room_idx];
+            // Enemies and what they do to players come only from the AI owner.
+            if ((channel == CH_ENEMY || (channel == CH_HERO && ptype == HERO_PLAYER_EVENT))
+                && sim_room->sim_owner != pl->id)
+                return;
+            // A dying owner reloads a checkpoint, which would reset every enemy for everyone.
+            if (channel == CH_HERO && ptype == HERO_PLAYER_LIFECYCLE && len > OL_HEADER_SIZE
+                && data[OL_HEADER_SIZE] == 0 && sim_room->sim_owner == pl->id) {
+                int next_owner = sim_next_owner(s, pl->room_idx, pl->id);
+                if (next_owner != 0)
+                    sim_set_owner(s, pl->room_idx, next_owner);
+            }
+        }
 
         // CH_SRV: HELLO and PING
         if (channel == CH_SRV) {

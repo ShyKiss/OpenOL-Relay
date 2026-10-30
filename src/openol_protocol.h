@@ -94,6 +94,7 @@
 #define SESS_WORLD        0x05   /* S->C [epoch LE2][cp][persist] - you are in this world */
 #define SESS_BASELINE_END 0x06   /* S->C [epoch LE2] - all world snapshots were sent */
 #define SESS_PLAYER_LEFT  0x07   /* S->C [player_id LE4] - player left the world */
+#define SESS_SIM_OWNER    0x08   /* S->C [player_id LE4] - the only client that runs enemy AI; 0 = none */
 
 #define SESS_ENTER_RESET  0x01   /* restart the world at this checkpoint */
 
