@@ -53,23 +53,8 @@ static void log_hook(const char *line) {
 static std::atomic<bool> *g_srv_running = nullptr;
 
 static void server_thread_fn(Server *s, volatile int *running) {
-    char buf[MAX_PACKET];
-    while (*g_srv_running && *running) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(s->sock, &rfds);
-        struct timeval tv = {0, 50000};
-        select((int)s->sock + 1, &rfds, NULL, NULL, &tv);
-        if (FD_ISSET(s->sock, &rfds)) {
-            Addr from;
-            socklen_t slen = sizeof(from.sa);
-            int len = (int)recvfrom(s->sock, buf, sizeof(buf), 0,
-                                    (struct sockaddr *)&from.sa, &slen);
-            if (len > 0) handle_packet(s, buf, len, &from);
-        }
-        run_heartbeat(s);
-        run_timeout(s);
-    }
+    while (*g_srv_running && *running)
+        server_poll(s);
     db_save(&s->db);
     server_shutdown(s);
 }

@@ -135,25 +135,8 @@ static void run_cli(DB *db) {
     cli_log("Type 'help' for available commands.");
     cli_redraw();
 
-    char buf[MAX_PACKET];
     while (g_running) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(g_server->sock, &rfds);
-        struct timeval tv = {0, 50000};
-        select((int)g_server->sock + 1, &rfds, NULL, NULL, &tv);
-
-        if (FD_ISSET(g_server->sock, &rfds)) {
-            Addr from;
-            socklen_t slen = sizeof(from.sa);
-            int len = (int)recvfrom(g_server->sock, buf, sizeof(buf), 0,
-                                    (struct sockaddr *)&from.sa, &slen);
-            if (len > 0)
-                handle_packet(g_server, buf, len, &from);
-        }
-
-        run_heartbeat(g_server);
-        run_timeout(g_server);
+        server_poll(g_server);
 
         if (cli_poll())
             cli_dispatch(g_server, cli_last_cmd);

@@ -1,7 +1,12 @@
 /*=============================================================================
     db.c - in-memory database with JSON persistence
 =============================================================================*/
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#endif
 #include "db.h"
+#include "relay_compat.h"  /* snprintf polyfill — after winsock2 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

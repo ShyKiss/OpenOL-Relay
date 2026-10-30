@@ -15,19 +15,33 @@
 // ---------------------------------------------------------------------------
 
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  ifndef NOMINMAX
-#    define NOMINMAX
+   /* Do NOT include winsock2.h or ws2tcpip.h here — server.h may be compiled
+      in a UE3 Unity build where windows.h already came first via MinWindows.h,
+      and ws2tcpip.h requires winsock2 symbols that are not available after
+      windows.h alone.  Instead, define sock_t as a fixed-size opaque integer
+      (UINT_PTR = 8 bytes on x64) matching the SOCKET typedef in winsock2.h,
+      so the Server struct layout is identical regardless of which winsock
+      header the translation unit happens to include first.
+      server.c / relay_api.c include winsock2.h themselves before server.h. */
+#  if !defined(_WINSOCK2API_) && !defined(_WINSOCK_H)
+     /* winsock2.h not yet included — bring in minimal declarations. */
+#    ifndef _WINDOWS_
+#      define WIN32_LEAN_AND_MEAN
+#      ifndef NOMINMAX
+#        define NOMINMAX
+#      endif
+#      include <winsock2.h>
+#    endif
 #  endif
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
 #  if defined(_MSC_VER)
 #    pragma comment(lib, "ws2_32.lib")
 #  endif
-   typedef SOCKET   sock_t;
+   /* Use UINT_PTR (always pointer-sized) as the socket handle type so the
+      struct layout is stable whether SOCKET came from winsock.h or winsock2.h. */
+   typedef UINT_PTR sock_t;
    typedef int      socklen_t;
-#  define INVALID_SOCK  INVALID_SOCKET
-#  define sock_close(s) closesocket(s)
+#  define INVALID_SOCK  ((sock_t)(~0))
+#  define sock_close(s) closesocket((SOCKET)(s))
 #  define SOCK_ERR      WSAGetLastError()
 #  define SOCK_WOULDBLOCK WSAEWOULDBLOCK
 static inline void platform_init() { WSADATA w; WSAStartup(MAKEWORD(2,2),&w); }
@@ -58,6 +72,15 @@ static inline double mono_now() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
+#endif
+
+// ---------------------------------------------------------------------------
+// Pack all relay structs tightly so layout is identical regardless of the
+// #pragma pack state active in the including translation unit (UE3 Unity
+// builds have pack(4) active from CoreClasses.h when server.h is included).
+// ---------------------------------------------------------------------------
+#ifdef _MSC_VER
+#  pragma pack(push, 8)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -97,7 +120,8 @@ static inline double mono_now() {
 
 // Snapshot drip-feed: max packets sent to a newcomer per server tick.
 // Prevents sendto() bursts from flooding the socket buffer on join.
-#define SNAP_DRIP_PER_TICK  32
+#define SNAP_DRIP_PER_TICK  16
+#define SNAP_DRIP_INTERVAL  0.02   // seconds between drip batches (800 packets/s per player)
 // Max snapshot queue depth per player.
 // Covers typical room state: ~10 players + ~200 doors*3 + ~300 enemies*3 + ~500 pickups = ~1710.
 // 2048 gives comfortable headroom without excessive memory use (~128 MB total for all players).
@@ -158,7 +182,11 @@ static inline int addr_eq(const Addr *a, const Addr *b) {
 }
 
 static inline void addr_ip_str(const Addr *a, char *buf, int len) {
-    inet_ntop(AF_INET, &a->sa.sin_addr, buf, len);
+    /* inet_ntoa requires only winsock.h v1 (available in any UE3 Unity build).
+       Result is a static thread-unsafe buffer — copy immediately. */
+    const char *s = inet_ntoa(a->sa.sin_addr);
+    if (s) { strncpy(buf, s, (size_t)len); buf[len - 1] = '\0'; }
+    else   { buf[0] = '\0'; }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +209,7 @@ typedef struct {
     int  pkt_len;
     int  room_idx;
     int  used;
-    int  owner_player_id;              // player currently pushing (0 = free)
+    int  owner_player_id;             // which player is currently pushing (0 = none)
 } PushSnapshot;
 
 // ---------------------------------------------------------------------------
@@ -288,64 +316,99 @@ typedef struct {
     PickupSnapshot  pickups[MAX_PICKUP_SNAPSHOTS];
     double         next_heartbeat;
     double         next_timeout;
+    double         next_snap_drain;
     char           name[64];
     int            player_id_seq; // monotonic counter for next_player_id
     GuiEventRing   gui_ring;
     HistoryRing    history;
+    // Set to 1 from outside thread to stop server_run() gracefully.
+    volatile int   shutdown_requested;
 } Server;
 
-// Pop a GUI packet event (called from GUI thread). Returns 1 if event available, 0 if empty.
-static inline int gui_pop_event(Server *s, GuiPacketEvent *out) {
-    unsigned t = __atomic_load_n(&s->gui_ring.tail, __ATOMIC_RELAXED);
-    unsigned h = __atomic_load_n(&s->gui_ring.head, __ATOMIC_ACQUIRE);
+// ---------------------------------------------------------------------------
+// Atomic helpers — portable MSVC VS2012 / GCC
+// ---------------------------------------------------------------------------
+
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#  define relay_load_acq(p)      (*(volatile unsigned *)(p))
+#  define relay_load_rlx(p)      (*(volatile unsigned *)(p))
+#  define relay_store_rel(p, v)  do { _WriteBarrier(); *(volatile unsigned *)(p) = (v); } while(0)
+#  define relay_fence_acq()      _ReadBarrier()
+#else
+#  define relay_load_acq(p)      __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#  define relay_load_rlx(p)      __atomic_load_n((p), __ATOMIC_RELAXED)
+#  define relay_store_rel(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#  define relay_fence_acq()      __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#endif
+
+#include <stdio.h>
+#include <stdarg.h>
+
+// Pop a GUI packet event (called from GUI/ImGui thread).
+static
+#if defined(_MSC_VER)
+__inline
+#else
+inline
+#endif
+int gui_pop_event(Server *s, GuiPacketEvent *out) {
+    unsigned t = relay_load_rlx(&s->gui_ring.tail);
+    unsigned h = relay_load_acq(&s->gui_ring.head);
     if (t == h) return 0;
-    // Copy before advancing tail — prevents server thread from overwriting
-    // the slot while GUI thread is still reading it.
     *out = s->gui_ring.buf[t & (GUI_RING_SIZE - 1)];
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    __atomic_store_n(&s->gui_ring.tail, t + 1, __ATOMIC_RELEASE);
+    relay_fence_acq();
+    relay_store_rel(&s->gui_ring.tail, t + 1);
     return 1;
 }
 
-// Push a GUI packet event (called from server thread; non-blocking, drops on overflow)
-static inline void gui_push_event(Server *s, int sender_slot, GuiPktCategory cat) {
-    unsigned h = __atomic_load_n(&s->gui_ring.head, __ATOMIC_RELAXED);
-    unsigned t = __atomic_load_n(&s->gui_ring.tail, __ATOMIC_ACQUIRE);
-    if ((h - t) >= GUI_RING_SIZE) return; // full — drop
-    GuiPacketEvent *ev = &s->gui_ring.buf[h & (GUI_RING_SIZE - 1)];
-    ev->sender_slot = sender_slot;
-    ev->category    = cat;
-    __atomic_store_n(&s->gui_ring.head, h + 1, __ATOMIC_RELEASE);
+// Push a GUI packet event (called from server thread; drops on overflow).
+static
+#if defined(_MSC_VER)
+__inline
+#else
+inline
+#endif
+void gui_push_event(Server *s, int sender_slot, GuiPktCategory cat) {
+    unsigned h = relay_load_rlx(&s->gui_ring.head);
+    unsigned t = relay_load_acq(&s->gui_ring.tail);
+    if ((h - t) >= GUI_RING_SIZE) return;
+    s->gui_ring.buf[h & (GUI_RING_SIZE - 1)].sender_slot = sender_slot;
+    s->gui_ring.buf[h & (GUI_RING_SIZE - 1)].category    = cat;
+    relay_store_rel(&s->gui_ring.head, h + 1);
 }
 
-// Push a history entry (called from server thread; non-blocking, overwrites on overflow).
-// We write into the slot BEFORE publishing head so the GUI thread never sees a
-// half-written message: it only observes the new head after the store-release,
-// by which time vsnprintf has already completed.
-#include <stdio.h>
-#include <stdarg.h>
-static inline void history_push(Server *s, const char *fmt, ...) {
-    unsigned h = __atomic_load_n(&s->history.head, __ATOMIC_RELAXED);
+// Push a log entry to history ring (called from server thread).
+static
+#if defined(_MSC_VER)
+__inline
+#else
+inline
+#endif
+void history_push(Server *s, const char *fmt, ...) {
+    unsigned h = relay_load_rlx(&s->history.head);
     HistoryEntry *e = &s->history.buf[h & (HISTORY_RING_SIZE - 1)];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(e->msg, HISTORY_MSG_LEN, fmt, ap);
     va_end(ap);
-    // store-release: makes the vsnprintf visible to the GUI thread
-    // only after the write is complete.
-    __atomic_store_n(&s->history.head, h + 1, __ATOMIC_RELEASE);
+    relay_store_rel(&s->history.head, h + 1);
 }
 
-// Pop a history entry into caller-supplied buf[HISTORY_MSG_LEN] (called from GUI thread).
-// Copies msg while server thread cannot touch this slot yet (tail not advanced),
-// then fence-acquires before advancing tail so the copy is complete first.
-static inline int history_pop(Server *s, char out[HISTORY_MSG_LEN]) {
-    unsigned t = __atomic_load_n(&s->history.tail, __ATOMIC_RELAXED);
-    unsigned h = __atomic_load_n(&s->history.head, __ATOMIC_ACQUIRE);
+// Pop a log entry (called from ImGui/GUI thread).
+static
+#if defined(_MSC_VER)
+__inline
+#else
+inline
+#endif
+int history_pop(Server *s, char out[HISTORY_MSG_LEN]) {
+    unsigned t = relay_load_rlx(&s->history.tail);
+    unsigned h = relay_load_acq(&s->history.head);
     if (t == h) return 0;
     memcpy(out, s->history.buf[t & (HISTORY_RING_SIZE - 1)].msg, HISTORY_MSG_LEN);
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    __atomic_store_n(&s->history.tail, t + 1, __ATOMIC_RELEASE);
+    relay_fence_acq();
+    relay_store_rel(&s->history.tail, t + 1);
     return 1;
 }
 
@@ -354,6 +417,7 @@ static inline int history_pop(Server *s, char out[HISTORY_MSG_LEN]) {
 // ---------------------------------------------------------------------------
 
 void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip, const char *db_path);
+void server_poll(Server *s);  // one iteration: wait, handle a packet, run background tasks
 void server_run(Server *s);
 void server_shutdown(Server *s);
 
@@ -396,3 +460,7 @@ void           send_snapshots_to_newcomer(Server *s, Player *newcomer);
 void handle_packet(Server *s, const char *data, int len, const Addr *addr);
 void run_heartbeat(Server *s);
 void run_timeout(Server *s);
+
+#ifdef _MSC_VER
+#  pragma pack(pop)
+#endif
