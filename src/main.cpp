@@ -145,6 +145,7 @@ static void run_cli(DB *db) {
     cli_log("Shutting down...");
     db_save(&g_server->db);
     cli_shutdown();
+    server_free_sessions(g_server);
     server_shutdown(g_server);
 }
 #endif

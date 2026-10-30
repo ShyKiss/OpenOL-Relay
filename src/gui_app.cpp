@@ -55,6 +55,7 @@ static std::atomic<bool> *g_srv_running = nullptr;
 static void server_thread_fn(Server *s, volatile int *running) {
     while (*g_srv_running && *running)
         server_poll(s);
+    server_free_sessions(s);
     db_save(&s->db);
     server_shutdown(s);
 }

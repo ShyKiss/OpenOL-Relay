@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "db.h"
+#include "ol_transport.h"
 
 // ---------------------------------------------------------------------------
 // Platform
@@ -121,6 +122,7 @@ static inline double mono_now() {
 // Snapshot drip-feed: max packets sent to a newcomer per server tick.
 // Prevents sendto() bursts from flooding the socket buffer on join.
 #define SNAP_DRIP_PER_TICK  16
+#define FLUSH_INTERVAL      0.01   // seconds between datagrams to each player; messages are batched
 #define SNAP_DRIP_INTERVAL  0.02   // seconds between drip batches (800 packets/s per player)
 // Max snapshot queue depth per player.
 // Covers typical room state: ~10 players + ~200 doors*3 + ~300 enemies*3 + ~500 pickups = ~1710.
@@ -293,6 +295,8 @@ typedef struct {
     // Session token — 32 random bytes generated on alloc, sent in SRV_READY.
     // Client echoes as 64-char hex in HELLO for reliable NAT rebind identification.
     uint8_t  session_token[32];
+    OlConn   conn;
+    int      pending_disconnect;  // set while a datagram is being processed
 } Player;
 
 // ---------------------------------------------------------------------------
@@ -317,6 +321,7 @@ typedef struct {
     double         next_heartbeat;
     double         next_timeout;
     double         next_snap_drain;
+    double         next_flush;
     char           name[64];
     int            player_id_seq; // monotonic counter for next_player_id
     GuiEventRing   gui_ring;
@@ -419,6 +424,7 @@ int history_pop(Server *s, char out[HISTORY_MSG_LEN]) {
 void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip, const char *db_path);
 void server_poll(Server *s);  // one iteration: wait, handle a packet, run background tasks
 void server_run(Server *s);
+void server_free_sessions(Server *s);  // call from the thread that ran server_poll, after it stops
 void server_shutdown(Server *s);
 
 Room   *server_find_room(Server *s, const char *code);

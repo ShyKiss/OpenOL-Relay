@@ -14,7 +14,7 @@ endif()
 # Common server sources (pure C)
 # ---------------------------------------------------------------------------
 
-set(SERVER_SOURCES server.c cli.c db.c)
+set(SERVER_SOURCES server.c cli.c db.c ol_transport.c)
 
 # ---------------------------------------------------------------------------
 # CLI target
