@@ -14,7 +14,7 @@ endif()
 # Common server sources (pure C)
 # ---------------------------------------------------------------------------
 
-set(SERVER_SOURCES server.c cli.c db.c ol_transport.c)
+set(SERVER_SOURCES server.c cli.c db.c ol_transport.c ol_crypto.c third_party/monocypher/monocypher.c)
 
 # ---------------------------------------------------------------------------
 # CLI target

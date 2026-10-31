@@ -17,31 +17,15 @@
 // Session token generation
 // ---------------------------------------------------------------------------
 
-// Fills out with bytes from the OS CSPRNG. Returns 0 on failure.
-static int os_random(uint8_t *out, unsigned len) {
-#ifdef _WIN32
-    typedef BOOLEAN (APIENTRY *RtlGenRandomFn)(PVOID, ULONG);
-    RtlGenRandomFn gen = NULL;
-    HMODULE lib = LoadLibraryA("advapi32.dll");
-    if (lib) gen = (RtlGenRandomFn)GetProcAddress(lib, "SystemFunction036");
-    return gen && gen(out, len);
-#else
-    size_t got = 0;
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (f) { got = fread(out, 1, len, f); fclose(f); }
-    return got == len;
-#endif
-}
-
 static uint64_t gen_conn_id(void) {
     uint64_t id = 0;
-    while (id == 0 && !os_random((uint8_t *)&id, sizeof(id)))
+    while (id == 0 && !ol_random((uint8_t *)&id, sizeof(id)))
         id = ((uint64_t)rand() << 32) ^ (uint64_t)rand() ^ (uint64_t)time(NULL);
     return id;
 }
 
 static void gen_session_token(uint8_t out[32]) {
-    if (!os_random(out, 32)) {
+    if (!ol_random(out, 32)) {
         // Last resort only: a predictable token is still better than no session.
         int i;
         srand((unsigned int)time(NULL) ^ (unsigned int)(size_t)out);
@@ -206,10 +190,17 @@ static int total_clients(Server *s) {
 // Send / relay
 // ---------------------------------------------------------------------------
 
-// Only for what must arrive before a session exists: READY and HELLO_FAIL.
+// Only for the handshake, which happens before a session exists.
 static void server_send_raw(Server *s, const Addr *addr, const char *msg, int len) {
     sendto(s->sock, msg, len, 0,
            (const struct sockaddr *)&addr->sa, sizeof(addr->sa));
+}
+
+static void send_sealed(Server *s, const Addr *addr, const uint8_t result_key[32], const void *msg, int len) {
+    uint8_t out[OL_HS_RESULT_MAX];
+    int n = ol_hs_server_result(result_key, msg, len, out);
+    if (n > 0)
+        server_send_raw(s, addr, (const char *)out, n);
 }
 
 static void player_send(Player *p, const char *msg, int len) {
@@ -253,7 +244,7 @@ void server_broadcast_room(Server *s, int room_idx, const char *msg, int len) {
 /* Send SRV_READY: [type(1)][pad(4)][player_id LE4][name_len(1)][name...][token(32)]
  * token — 32-byte session token for NAT rebind identification (echoed in HELLO).
  * conn_id — identifies this session in every later datagram. */
-static void send_ready(Server *s, const Addr *addr, int player_id, const uint8_t token[32], uint64_t conn_id) {
+static void send_ready(Server *s, const Addr *addr, const uint8_t result_key[32], int player_id, const uint8_t token[32], uint64_t conn_id) {
     unsigned char buf[306]; /* 5 hdr + 4 id + 1 namelen + 255 name + 32 token + 8 conn_id */
     int ci;
     SRV_HDR_INIT(buf, SRV_READY);
@@ -268,7 +259,7 @@ static void send_ready(Server *s, const Addr *addr, int player_id, const uint8_t
     memcpy(buf + 10 + name_len, token, 32);
     for (ci = 0; ci < 8; ci++)
         buf[10 + name_len + 32 + ci] = (unsigned char)(conn_id >> (8 * ci));
-    server_send_raw(s, addr, (const char *)buf, 10 + name_len + 32 + 8);
+    send_sealed(s, addr, result_key, buf, 10 + name_len + 32 + 8);
 }
 
 /* Send SRV_ONLINE_COUNT: [0x28][0x00000000][count LE4] */
@@ -292,14 +283,14 @@ static void broadcast_online_count(Server *s, int room_idx, int count) {
 }
 
 /* Send SRV_HELLO_FAIL: [0x29][0x00000000][reason_len(1)][reason ASCII] */
-static void send_hello_fail(Server *s, const Addr *addr, const char *reason) {
+static void send_hello_fail(Server *s, const Addr *addr, const uint8_t result_key[32], const char *reason) {
     unsigned char buf[262];
     SRV_HDR_INIT(buf, SRV_HELLO_FAIL);
     int rlen = (int)strlen(reason);
     if (rlen > 255) rlen = 255;
     buf[5] = (unsigned char)rlen;
     memcpy(buf + 6, reason, rlen);
-    server_send_raw(s, addr, (const char *)buf, 6 + rlen);
+    send_sealed(s, addr, result_key, buf, 6 + rlen);
 }
 
 /* Send SRV_DISCONNECT: [0x2A][0x00000000][player_id LE4] */
@@ -728,138 +719,126 @@ static int hello_check_rate(const char *ip) {
 // HELLO handshake
 // ---------------------------------------------------------------------------
 
-static void handle_hello(Server *s, const char *line, const Addr *addr) {
-    // HELLO,<room>[,<password>]
-    char code[MAX_ROOM_CODE]  = {0};
-    char password[MAX_PASSWORD] = {0};
+static void send_world_msg(Player *p, unsigned char type, const Room *room);
 
-    const char *p = line + 6; // skip "HELLO,"
-    const char *comma = strchr(p, ',');
-    if (comma) {
-        int clen = (int)(comma - p);
-        if (clen >= MAX_ROOM_CODE) clen = MAX_ROOM_CODE - 1;
-        memcpy(code, p, clen);
-        strncpy(password, comma + 1, MAX_PASSWORD - 1);
-        // Strip trailing newline
-        char *nl = strchr(password, '\n');
-        if (nl) *nl = '\0';
-        nl = strchr(password, '\r');
-        if (nl) *nl = '\0';
-    } else {
-        int clen = (int)strlen(p);
-        // Strip trailing newline
-        while (clen > 0 && (p[clen-1] == '\n' || p[clen-1] == '\r')) clen--;
-        if (clen >= MAX_ROOM_CODE) clen = MAX_ROOM_CODE - 1;
-        memcpy(code, p, clen);
-    }
+static void handle_hs_hello(Server *s, const char *data, int len, const Addr *addr) {
+    uint8_t out[OL_HS_CHALLENGE_BYTES];
+    // Smaller than OL_HS_HELLO_BYTES would make the challenge an amplifier.
+    if (len < OL_HS_HELLO_BYTES || (unsigned char)data[1] != OL_HS_VERSION) return;
+    ol_hs_server_challenge(&s->hs, &addr->sa, sizeof(addr->sa), (uint32_t)time(NULL), out);
+    server_send_raw(s, addr, (const char *)out, sizeof(out));
+}
+
+static void handle_hs_auth(Server *s, const char *data, int len, const Addr *addr) {
+    // Static so a burst of attempts does not put this on the stack over and over.
+    static OlHsAuth auth;
+    if (!ol_hs_server_auth(&s->hs, &addr->sa, sizeof(addr->sa), (uint32_t)time(NULL),
+                           (const uint8_t *)data, len, &auth))
+        return;
+    const uint8_t *result_key = auth.result_key;
+    const char *code = auth.room;
 
     if (!code[0]) {
-        send_hello_fail(s, addr, "invalid room");
+        send_hello_fail(s, addr, result_key, "invalid room");
         return;
     }
 
     char client_ip[MAX_IP];
     addr_ip_str(addr, client_ip, sizeof(client_ip));
 
-    if (!hello_check_rate(client_ip)) {
-        // Silently drop — don't send a response (prevents amplification)
-        return;
-    }
+    // Bounds password guessing per address.
+    if (!hello_check_rate(client_ip)) return;
 
     if (db_find_ban(&s->db, client_ip)) {
-        send_hello_fail(s, addr, "banned");
+        send_hello_fail(s, addr, result_key, "banned");
         return;
     }
 
     Room *room = server_find_room(s, code);
     if (!room) {
-        send_hello_fail(s, addr, "unknown room");
+        send_hello_fail(s, addr, result_key, "unknown room");
         return;
     }
+    int room_idx = (int)(room - s->rooms);
 
     {
         DBRoom *dr_check = db_find_room(&s->db, code);
         if (dr_check && db_find_room_ban(dr_check, client_ip)) {
-            send_hello_fail(s, addr, "banned from room");
+            send_hello_fail(s, addr, result_key, "banned from room");
             return;
         }
     }
 
-    if (room->password[0]) {
-        DBRoom *dr = db_find_room(&s->db, room->code);
-        int trusted = dr ? db_is_trusted(dr, client_ip) : 0;
-        if (!trusted && strcmp(room->password, password) != 0) {
-            send_hello_fail(s, addr, "wrong password");
+    const int is_sim = auth.role == OL_ROLE_SIM;
+    if (is_sim) {
+        // Whoever owns the AI decides what enemies do to players, so a room password is not enough.
+        Player *node = sim_node(s, room_idx);
+        if (!s->sim_secret[0] || !ol_hs_proof_ok(&auth, s->sim_secret)) {
+            server_log(s, "[%s] refused as simulator: wrong secret", client_ip);
+            send_hello_fail(s, addr, result_key, "simulator not allowed");
             return;
         }
-        if (!trusted && dr) {
-            db_add_trusted(dr, client_ip);
-            db_save(&s->db);
+        if (node && memcmp(node->hs_client_pub, auth.client_pub, 32) != 0) {
+            send_hello_fail(s, addr, result_key, "room already has a simulator");
+            return;
+        }
+    } else if (room->password[0] && !ol_hs_proof_ok(&auth, room->password)) {
+        send_hello_fail(s, addr, result_key, "wrong password");
+        return;
+    }
+
+    Player *pl = NULL;
+    for (int i = 0; i < MAX_CLIENTS && !pl; i++) {
+        Player *p = &s->players[i];
+        if (p->used && memcmp(p->hs_client_pub, auth.client_pub, 32) == 0) {
+            // Our answer got lost and the client repeated itself: same session, same keys.
+            p->addr = *addr;
+            send_ready(s, addr, result_key, p->id, p->session_token, p->conn.conn_id);
+            return;
         }
     }
 
-    // Parse optional session token (4th HELLO field): "HELLO,ROOM,PASS,<hex64>"
-    // The token is 32 bytes encoded as 64 lowercase hex chars.
-    uint8_t hello_token[32];
-    int     has_token = 0;
-    {
-        // Count commas to find the 4th field
-        const char *scan = line + 6; // skip "HELLO,"
-        int commas = 0;
-        while (*scan) {
-            if (*scan == ',') { commas++; if (commas == 3) { scan++; break; } }
-            scan++;
-        }
-        if (commas == 3 && strlen(scan) >= 64) {
-            has_token = 1;
-            for (int i = 0; i < 32; i++) {
-                unsigned int byte_val = 0;
-                if (sscanf(scan + i * 2, "%02x", &byte_val) == 1)
-                    hello_token[i] = (uint8_t)byte_val;
-                else { has_token = 0; break; }
-            }
-        }
+    // The token is the only way to take over a session that is already in use.
+    if (auth.has_token) {
+        pl = server_find_player_by_token(s, room_idx, auth.token);
+        if (pl)
+            server_log(s, "[%s] ID=%d resumed its session (port %d->%d)", client_ip, pl->id,
+                       ntohs(pl->addr.sa.sin_port), ntohs(addr->sa.sin_port));
     }
-
-    // Re-use existing slot if same addr reconnects (exact match first).
-    Player *pl = server_find_player_by_addr(s, addr);
+    // Earlier attempt from this address whose answer never arrived: nothing runs on it yet.
     if (!pl) {
-        int room_idx = (int)(room - s->rooms);
-
-        // Token match only — no IP-only fallback.
-        // IP fallback is unsafe on loopback (multiple clients share 127.0.0.1).
-        if (has_token) {
-            Player *candidate = server_find_player_by_token(s, room_idx, hello_token);
-            if (candidate) {
-                server_log(s, "[%s] ID=%d NAT rebind via token (port %d→%d), reusing slot",
-                           client_ip, candidate->id,
-                           ntohs(candidate->addr.sa.sin_port), ntohs(addr->sa.sin_port));
-                candidate->addr = *addr;
-                pl = candidate;
-            }
-        }
+        Player *p = server_find_player_by_addr(s, addr);
+        if (p && p->room_idx == room_idx && !p->conn.have_counter)
+            pl = p;
     }
-    if (pl && pl->room_idx == (int)(room - s->rooms)) {
-        int count = server_room_player_count(s, pl->room_idx);
-        // The client starts a fresh transport session for every HELLO it sends.
+    if (pl) {
+        int count;
+        pl->addr = *addr;
+        pl->is_sim = is_sim;
+        memcpy(pl->hs_client_pub, auth.client_pub, 32);
+        count = server_room_player_count(s, pl->room_idx);
+        // The client starts a fresh transport session for every handshake.
         ol_conn_reset(&pl->conn, gen_conn_id());
-        send_ready(s, addr, pl->id, pl->session_token, pl->conn.conn_id);
+        ol_conn_set_keys(&pl->conn, auth.s2c_key, auth.c2s_key);
+        send_ready(s, addr, result_key, pl->id, pl->session_token, pl->conn.conn_id);
         send_online_count(s, addr, count);
         if (room->sim_owner != 0)
             send_sim_owner(pl, room->sim_owner);
         // The client reports its world next (SESS_ENTER) and gets the snapshots then.
         pl->in_world = 0;
+        if (is_sim && room->world_persist[0])
+            send_world_msg(pl, SESS_TRAVEL, room);
         return;
     }
 
     if (total_clients(s) >= MAX_CLIENTS) {
-        send_hello_fail(s, addr, "server full");
+        send_hello_fail(s, addr, result_key, "server full");
         return;
     }
 
     pl = alloc_player(s);
     if (!pl) {
-        send_hello_fail(s, addr, "server full");
+        send_hello_fail(s, addr, result_key, "server full");
         return;
     }
 
@@ -872,8 +851,11 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
     pl->pkt_window = pl->last_seen;
     addr_ip_str(addr, pl->ip, sizeof(pl->ip));
     snprintf(pl->nick, sizeof(pl->nick), "Player%d", pl->id);
+    pl->is_sim    = is_sim;
+    memcpy(pl->hs_client_pub, auth.client_pub, 32);
     gen_session_token(pl->session_token);
     ol_conn_reset(&pl->conn, gen_conn_id());
+    ol_conn_set_keys(&pl->conn, auth.s2c_key, auth.c2s_key);
 
     int count = server_room_player_count(s, pl->room_idx);
     server_log(s, "[%s:%d] ID=%d joined room '%s' (%d players)",
@@ -887,11 +869,16 @@ static void handle_hello(Server *s, const char *line, const Addr *addr) {
             send_online_count(s, &other->addr, count);
     }
 
-    send_ready(s, addr, pl->id, pl->session_token, pl->conn.conn_id);
+    send_ready(s, addr, result_key, pl->id, pl->session_token, pl->conn.conn_id);
     send_online_count(s, addr, count);
     // Known before the client loads a map, so it does not spawn enemies of its own.
     if (room->sim_owner != 0)
         send_sim_owner(pl, room->sim_owner);
+    if (is_sim) {
+        server_log(s, "Room '%s' simulator: ID=%d", room->code, pl->id);
+        if (room->world_persist[0])
+            send_world_msg(pl, SESS_TRAVEL, room);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,28 +1080,11 @@ static void session_leave(Server *s, Player *pl) {
         notify_player_left(s, pl);
 }
 
-static void session_sim_hello(Server *s, Player *pl) {
-    Room *room = &s->rooms[pl->room_idx];
-    Player *node = sim_node(s, pl->room_idx);
-    if (node && node != pl) {
-        server_log(s, "Room '%s' already has a simulator (ID=%d), ignoring ID=%d", room->code, node->id, pl->id);
-        return;
-    }
-    if (!pl->is_sim) {
-        pl->is_sim = 1;
-        broadcast_online_count(s, pl->room_idx, server_room_player_count(s, pl->room_idx));
-        server_log(s, "Room '%s' simulator: ID=%d", room->code, pl->id);
-    }
-    if (room->world_persist[0])
-        send_world_msg(pl, SESS_TRAVEL, room);
-}
-
 static void handle_session(Server *s, Player *pl, unsigned char ptype, const char *data, int len) {
     switch (ptype) {
         case SESS_ENTER:      session_enter(s, pl, data, len); break;
         case SESS_CHECKPOINT: session_checkpoint(s, pl, data, len); break;
         case SESS_LEAVE:      session_leave(s, pl); break;
-        case SESS_SIM_HELLO:  session_sim_hello(s, pl); break;
         default: break;
     }
 }
@@ -1330,7 +1300,7 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
                 server_log(s, "[%s] ID=%d identified as '%s'", pl->ip, pl->id, pl->nick);
                 history_push(s, "[%s] identified", pl->nick);
             } else if (ptype == SRV_PING) {
-                server_send(s, addr, data, len);
+                player_send(pl, data, len);
             }
             return;
         }
@@ -1674,11 +1644,14 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
 typedef struct {
     Server *s;
     Player *pl;
+    const Addr *from;
 } TransportCtx;
 
 static void transport_deliver(void *user, int lane, uint8_t *msg, int len) {
     TransportCtx *ctx = (TransportCtx *)user;
     (void)lane;
+    // Only an authentic datagram gets here: conn_id alone must not redirect a session.
+    ctx->pl->addr = *ctx->from;
     handle_message(ctx->s, ctx->pl, (char *)msg, len);
 }
 
@@ -1705,28 +1678,24 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
         double now = mono_now();
         if (!ol_peek_conn_id((const uint8_t *)data, len, &conn_id)) return;
         ctx.s = s;
+        ctx.from = addr;
         ctx.pl = find_player_by_conn_id(s, conn_id);
         if (!ctx.pl) return;
-        ctx.pl->addr = *addr;  // follows NAT rebinding: conn_id identifies the session
+        if (!ol_conn_on_datagram(&ctx.pl->conn, now, (const uint8_t *)data, len, transport_deliver, &ctx))
+            return;
+        // Follows NAT rebinding, also for a datagram that carried only acks.
+        ctx.pl->addr = *addr;
         ctx.pl->last_seen = now;
-        ol_conn_on_datagram(&ctx.pl->conn, now, (const uint8_t *)data, len, transport_deliver, &ctx);
         if (ctx.pl->pending_disconnect)
             server_disconnect(s, ctx.pl);
         return;
     }
 
-    // HELLO is the only packet accepted outside a session.
-    if (len >= 6 && strncmp(data, "HELLO,", 6) == 0) {
-        char buf[MAX_PACKET + 1];
-        int end;
-        if (len > MAX_PACKET) len = MAX_PACKET;
-        memcpy(buf, data, len);
-        buf[len] = '\0';
-        end = len - 1;
-        while (end >= 0 && (buf[end] == '\n' || buf[end] == '\r' || buf[end] == ' '))
-            buf[end--] = '\0';
-        handle_hello(s, buf, addr);
-    }
+    // Only the handshake is accepted outside a session.
+    if ((unsigned char)data[0] == OL_HS_HELLO && len >= 2)
+        handle_hs_hello(s, data, len, addr);
+    else if ((unsigned char)data[0] == OL_HS_AUTH)
+        handle_hs_auth(s, data, len, addr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1768,6 +1737,17 @@ void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip
     db_init(&s->db, db_path ? db_path : "relay.json");
 
     platform_init();
+
+    // Without keys nobody could connect safely, so there is nothing to fall back to.
+    if (!ol_hs_server_init(&s->hs)) {
+        fprintf(stderr, "No secure random source\n");
+        exit(1);
+    }
+    {
+        const char *sim_secret = getenv("OPENOL_SIM_SECRET");
+        if (sim_secret)
+            strncpy(s->sim_secret, sim_secret, sizeof(s->sim_secret) - 1);
+    }
 
     s->sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (s->sock == INVALID_SOCK) {
@@ -1828,6 +1808,7 @@ static void flush_players(Server *s) {
             TransportCtx ctx;
             ctx.s = s;
             ctx.pl = &s->players[i];
+            ctx.from = NULL;
             ol_conn_flush(&s->players[i].conn, now, transport_send, &ctx);
         }
     }

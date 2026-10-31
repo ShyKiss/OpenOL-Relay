@@ -100,11 +100,16 @@
 #define SESS_BASELINE_END 0x06   /* S->C [epoch LE2] - all world snapshots were sent */
 #define SESS_PLAYER_LEFT  0x07   /* S->C [player_id LE4] - player left the world */
 #define SESS_SIM_OWNER    0x08   /* S->C [player_id LE4] - the only client that runs enemy AI; 0 = none */
-#define SESS_SIM_HELLO    0x09   /* C->S (no payload) - this connection is a headless simulator, not a player */
 
 #define SESS_ENTER_RESET  0x01   /* restart the world at this checkpoint */
 
 /* Server -> client notifications */
+/* Handshake, outside any session: see ol_crypto.h. 0xF3 is the transport's OL_MAGIC. */
+#define OL_HS_HELLO      0xF0
+#define OL_HS_CHALLENGE  0xF1
+#define OL_HS_AUTH       0xF2
+#define OL_HS_RESULT     0xF4
+
 #define SRV_READY        0xE0   /* [player_id LE(4)][name_len(1)][name ASCII][token(32)] */
 #define SRV_ONLINE_COUNT 0xE1   /* [count LE(4)] */
 #define SRV_HELLO_FAIL   0xE2   /* [reason_len(1)][reason ASCII] */

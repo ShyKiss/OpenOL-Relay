@@ -2,8 +2,13 @@
     ol_transport.h - reliable UDP transport shared by the client and the relay.
 
     Datagram (at most OL_MAX_DATAGRAM bytes):
-      [OL_MAGIC(1)][conn_id LE8][seq LE2][ack_next LE2][ack_bits LE4]
-      { [lane(1)][msg_id LE2, reliable lane only][len LE2][bytes] } * N
+      [OL_MAGIC(1)][conn_id LE8][counter LE4][mac 16]
+      sealed: [seq LE2][ack_next LE2][ack_bits LE4]
+              { [lane(1)][msg_id LE2, reliable lane only][len LE2][bytes] } * N
+
+    XChaCha20-Poly1305, one key per direction, the clear part is authenticated too.
+    A datagram that fails the check changes nothing, and each counter value is
+    accepted once. A connection without keys neither sends nor accepts anything.
 
     OL_LANE_STATE    unreliable, messages from older datagrams are dropped
     OL_LANE_RELIABLE reliable and ordered
@@ -22,7 +27,7 @@
 
 #define OL_MAGIC          0xF3
 #define OL_MAX_DATAGRAM   1200
-#define OL_HEADER_BYTES   17
+#define OL_HEADER_BYTES   37
 #define OL_MAX_MSG        (OL_MAX_DATAGRAM - OL_HEADER_BYTES - 5)
 #define OL_QUEUE_SIZE     512   /* queued reliable messages per connection */
 #define OL_WINDOW         128   /* reliable messages in flight, and reorder buffer size */
@@ -60,6 +65,14 @@ typedef struct {
     uint8_t  have_recv;
     uint8_t  ack_dirty;
 
+    uint8_t  send_key[32];
+    uint8_t  recv_key[32];
+    uint8_t  keyed;
+    uint8_t  have_counter;
+    uint32_t send_counter;
+    uint32_t recv_counter;             /* highest accepted */
+    uint64_t recv_window;              /* bit i: recv_counter - i was accepted */
+
     uint8_t  state_buf[OL_STATE_BUF];  /* { [len LE2][bytes] } * N */
     int      state_len;
 } OlConn;
@@ -71,6 +84,9 @@ typedef void (*OlSendFn)(void *user, const uint8_t *datagram, int len);
 void ol_conn_reset(OlConn *c, uint64_t conn_id);
 void ol_conn_free(OlConn *c);
 
+/* Must follow every reset: the keys go away with it. */
+void ol_conn_set_keys(OlConn *c, const uint8_t send_key[32], const uint8_t recv_key[32]);
+
 /* Returns 1 if queued, 0 if the message is too large or the queue is full. */
 int  ol_conn_send(OlConn *c, int lane, const void *msg, int len);
 /* Reliable messages that can still be queued. */
@@ -81,7 +97,7 @@ int  ol_conn_reliable_pending(const OlConn *c);
 /* Sends queued state, due reliable messages and acks. */
 void ol_conn_flush(OlConn *c, double now, OlSendFn send, void *user);
 
-/* Handles one datagram. Returns 1 if it belongs to this connection, 0 if not. */
+/* Handles one datagram. Returns 1 if it is authentic and new, 0 if it was ignored. */
 int  ol_conn_on_datagram(OlConn *c, double now, const uint8_t *data, int len,
                          OlDeliverFn deliver, void *user);
 

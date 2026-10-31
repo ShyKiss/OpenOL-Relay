@@ -3,8 +3,13 @@
 =============================================================================*/
 #include "ol_transport.h"
 #include "openol_protocol.h"
+#include "third_party/monocypher/monocypher.h"
 #include <stdlib.h>
 #include <string.h>
+
+#define OL_COUNTER_AT  9
+#define OL_MAC_AT      13
+#define OL_SEALED_AT   29
 
 #define OL_RTO_INITIAL 0.2
 #define OL_RTO_MIN     0.05
@@ -37,6 +42,12 @@ void ol_conn_reset(OlConn *c, uint64_t conn_id) {
     memset(c, 0, sizeof(*c));
     c->conn_id = conn_id;
     c->rto = OL_RTO_INITIAL;
+}
+
+void ol_conn_set_keys(OlConn *c, const uint8_t send_key[32], const uint8_t recv_key[32]) {
+    memcpy(c->send_key, send_key, 32);
+    memcpy(c->recv_key, recv_key, 32);
+    c->keyed = 1;
 }
 
 int ol_conn_reliable_room(const OlConn *c) { return OL_QUEUE_SIZE - c->out_count; }
@@ -77,16 +88,63 @@ static int write_header(OlConn *c, uint8_t *p) {
     }
     p[0] = OL_MAGIC;
     put64(p + 1, c->conn_id);
-    put16(p + 9, c->send_seq++);
-    put16(p + 11, c->in_next);
-    put32(p + 13, bits);
+    put16(p + OL_SEALED_AT, c->send_seq++);
+    put16(p + OL_SEALED_AT + 2, c->in_next);
+    put32(p + OL_SEALED_AT + 4, bits);
     return OL_HEADER_BYTES;
+}
+
+/* Keys are per session and direction, so the counter alone makes the nonce unique. */
+static void make_nonce(uint8_t nonce[24], uint32_t counter) {
+    memset(nonce, 0, 24);
+    put32(nonce, counter);
+}
+
+static void seal(OlConn *c, uint8_t *p, int n) {
+    uint8_t nonce[24];
+    uint32_t counter = c->send_counter++;
+    put32(p + OL_COUNTER_AT, counter);
+    make_nonce(nonce, counter);
+    crypto_aead_lock(p + OL_SEALED_AT, p + OL_MAC_AT, c->send_key, nonce,
+                     p, OL_MAC_AT, p + OL_SEALED_AT, n - OL_SEALED_AT);
+}
+
+/* Decrypts in place. Replay state changes only after the datagram proved authentic. */
+static int unseal(OlConn *c, uint8_t *p, int n, const uint8_t *data) {
+    uint8_t nonce[24];
+    uint32_t counter = get32(data + OL_COUNTER_AT);
+    uint32_t behind = 0;
+
+    if (c->have_counter && counter <= c->recv_counter) {
+        behind = c->recv_counter - counter;
+        if (behind >= 64 || (c->recv_window >> behind) & 1) return 0;
+    }
+    make_nonce(nonce, counter);
+    if (crypto_aead_unlock(p + OL_SEALED_AT, data + OL_MAC_AT, c->recv_key, nonce,
+                           data, OL_MAC_AT, data + OL_SEALED_AT, n - OL_SEALED_AT) != 0)
+        return 0;
+
+    if (!c->have_counter) {
+        c->have_counter = 1;
+        c->recv_counter = counter;
+        c->recv_window = 1;
+    } else if (counter > c->recv_counter) {
+        uint32_t ahead = counter - c->recv_counter;
+        c->recv_window = ahead >= 64 ? 0 : c->recv_window << ahead;
+        c->recv_window |= 1;
+        c->recv_counter = counter;
+    } else {
+        c->recv_window |= (uint64_t)1 << behind;
+    }
+    return 1;
 }
 
 void ol_conn_flush(OlConn *c, double now, OlSendFn send, void *user) {
     int state_pos = 0;
     int next = 0;  /* position in the reliable queue */
     int limit = c->out_count < OL_WINDOW ? c->out_count : OL_WINDOW;
+
+    if (!c->keyed) return;
 
     for (;;) {
         uint8_t p[OL_MAX_DATAGRAM];
@@ -130,6 +188,7 @@ void ol_conn_flush(OlConn *c, double now, OlSendFn send, void *user) {
             c->send_seq--;
             break;
         }
+        seal(c, p, n);
         send(user, p, n);
         c->ack_dirty = 0;
         if (state_pos >= c->state_len && next >= limit) break;
@@ -203,16 +262,19 @@ int ol_peek_conn_id(const uint8_t *data, int len, uint64_t *out) {
     return 1;
 }
 
-int ol_conn_on_datagram(OlConn *c, double now, const uint8_t *data, int len,
+int ol_conn_on_datagram(OlConn *c, double now, const uint8_t *packet, int len,
                         OlDeliverFn deliver, void *user) {
+    uint8_t data[OL_MAX_DATAGRAM];
     uint64_t conn_id;
     uint16_t seq;
     int fresh, off;
 
-    if (!ol_peek_conn_id(data, len, &conn_id) || conn_id != c->conn_id) return 0;
+    if (!c->keyed || len > OL_MAX_DATAGRAM) return 0;
+    if (!ol_peek_conn_id(packet, len, &conn_id) || conn_id != c->conn_id) return 0;
+    if (!unseal(c, data, len, packet)) return 0;
 
-    seq = get16(data + 9);
-    process_acks(c, get16(data + 11), get32(data + 13), now);
+    seq = get16(data + OL_SEALED_AT);
+    process_acks(c, get16(data + OL_SEALED_AT + 2), get32(data + OL_SEALED_AT + 4), now);
 
     fresh = !c->have_recv || id_diff(seq, c->recv_seq) > 0;
     if (fresh) {

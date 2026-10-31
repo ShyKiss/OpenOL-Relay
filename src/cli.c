@@ -411,9 +411,6 @@ static void print_help(void) {
     cmd_print("    unban <ip>                    - remove global ban");
     cmd_print("    unban room <code> <ip>        - remove room ban");
     cmd_print("    bans                          - list all bans");
-    cmd_print("    trust add <room> <ip>         - manually trust IP in room");
-    cmd_print("    trust remove <room> <ip>      - revoke room trust");
-    cmd_print("    trust list [room]             - list trusted IPs");
     cmd_print("    room create <code> [password] - create room");
     cmd_print("    setpw <code> <password>       - change room password");
     cmd_print("    log on|off                    - toggle packet logging");
@@ -493,11 +490,10 @@ void cli_dispatch(Server *s, const char *line) {
             any = 1;
             int count   = server_room_player_count(s, ri);
             DBRoom *dr  = db_find_room(&s->db, r->code);
-            int n_trust = dr ? dr->n_trusted : 0;
             int n_bans  = dr ? dr->n_bans    : 0;
             const char *pw = r->password[0] ? r->password : "(no password)";
-            cmd_print("  '%s': %d player(s)  password=%s  trusted=%d  bans=%d",
-                      r->code, count, pw, n_trust, n_bans);
+            cmd_print("  '%s': %d player(s)  password=%s  bans=%d",
+                      r->code, count, pw, n_bans);
         }
         if (!any) cmd_print("  (no rooms)");
         return;
@@ -602,55 +598,6 @@ void cli_dispatch(Server *s, const char *line) {
         return;
     }
 
-    // trust add <room> <ip>
-    if (strcmp(toks[0], "trust") == 0 && ntok >= 2 && strcmp(toks[1], "add") == 0) {
-        if (ntok < 4) { cmd_print("  Usage: trust add <room> <ip>"); return; }
-        const char *code = toks[2];
-        const char *ip   = toks[3];
-        DBRoom *dr = db_find_room(&s->db, code);
-        if (!dr) { cmd_print("  Unknown room '%s'", code); return; }
-        if (db_is_trusted(dr, ip)) {
-            cmd_print("  %s is already trusted in '%s'", ip, code);
-            return;
-        }
-        db_add_trusted(dr, ip);
-        db_save(&s->db);
-        cli_log("Admin: trusted %s in room '%s'", ip, code);
-        return;
-    }
-
-    // trust remove <room> <ip>
-    if (strcmp(toks[0], "trust") == 0 && ntok >= 2 && strcmp(toks[1], "remove") == 0) {
-        if (ntok < 4) { cmd_print("  Usage: trust remove <room> <ip>"); return; }
-        const char *code = toks[2];
-        const char *ip   = toks[3];
-        DBRoom *dr = db_find_room(&s->db, code);
-        if (!dr || !db_remove_trusted(dr, ip)) {
-            cmd_print("  No trust record for %s in '%s'", ip, code);
-            return;
-        }
-        db_save(&s->db);
-        cli_log("Admin: removed trust for %s in room '%s'", ip, code);
-        return;
-    }
-
-    // trust list [room]
-    if (strcmp(toks[0], "trust") == 0 && ntok >= 2 && strcmp(toks[1], "list") == 0) {
-        const char *filter = ntok >= 3 ? toks[2] : NULL;
-        int any = 0;
-        for (int i = 0; i < s->db.n_rooms; i++) {
-            DBRoom *dr = &s->db.rooms[i];
-            if (filter && strcmp(dr->code, filter) != 0) continue;
-            if (dr->n_trusted == 0) continue;
-            any = 1;
-            cmd_print("  Room '%s':", dr->code);
-            for (int t = 0; t < dr->n_trusted; t++)
-                cmd_print("    %s", dr->trusted[t]);
-        }
-        if (!any) cmd_print("  (no trusted IPs%s)", filter ? " for that room" : "");
-        return;
-    }
-
     // room create <code> [password]
     if (strcmp(toks[0], "room") == 0 && ntok >= 2 && strcmp(toks[1], "create") == 0) {
         if (ntok < 3) { cmd_print("  Usage: room create <code> [password]"); return; }
@@ -677,7 +624,7 @@ void cli_dispatch(Server *s, const char *line) {
         if (!r) { cmd_print("  Unknown room '%s'", code); return; }
         server_set_room_password(s, r, pw);
         db_save(&s->db);
-        cli_log("Admin: password changed for room '%s' (trusted IPs cleared)", code);
+        cli_log("Admin: password changed for room '%s'", code);
         return;
     }
 

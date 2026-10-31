@@ -14,7 +14,7 @@ Relay is a UDP server that receives packets from OpenOL clients and forwards the
 ## Features
 
 - **UDP server** for 128 clients and up to 64 rooms
-- **Rooms** with or without a password, "trusted" IPs (no need to re-enter the password)
+- **Rooms** with or without a password
 - **Bans** — global and per-room, with a reason
 - **World sync** for players who join later: player, door, enemy and pickup states
 - **Door priority per player** — while one player is interacting with a door, the others get a denial (`DOOR_DENY`)
@@ -61,11 +61,8 @@ Available both in the TUI and in the input field on the **Log** tab in the GUI.
 | `unban <ip>` | Remove a global ban |
 | `unban room <code> <ip>` | Remove a ban in a room |
 | `bans` | List all bans |
-| `trust add <room> <ip>` | Manually add an IP to a room's trusted list |
-| `trust remove <room> <ip>` | Remove an IP from the trusted list |
-| `trust list [room]` | List trusted IPs |
 | `room create <code> [password]` | Create a room |
-| `setpw <code> <password>` | Change a room's password (the trusted IP list is cleared) |
+| `setpw <code> <password>` | Change a room's password |
 | `quit` | Shut down the server |
 
 ## Built with

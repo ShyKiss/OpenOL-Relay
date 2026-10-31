@@ -10,6 +10,7 @@
 #include <time.h>
 #include "db.h"
 #include "ol_transport.h"
+#include "ol_crypto.h"
 
 // ---------------------------------------------------------------------------
 // Platform
@@ -321,6 +322,7 @@ typedef struct {
     int      pending_disconnect;  // set while a datagram is being processed
     int      in_world;            // receives and sends world traffic
     int      is_sim;              // headless simulator: runs enemy AI, players never see it
+    uint8_t  hs_client_pub[32];   // key of the handshake behind this session
 } Player;
 
 // ---------------------------------------------------------------------------
@@ -347,6 +349,8 @@ typedef struct {
     double         next_timeout;
     double         next_snap_drain;
     double         next_flush;
+    OlHsServer     hs;
+    char           sim_secret[128];   // OPENOL_SIM_SECRET; empty means no simulators
     char           name[64];
     int            player_id_seq; // monotonic counter for next_player_id
     GuiEventRing   gui_ring;

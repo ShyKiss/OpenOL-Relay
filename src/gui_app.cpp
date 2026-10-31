@@ -458,16 +458,6 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
                             continue;
                         }
                         ImGui::PopStyleColor();
-                        ImGui::SameLine();
-
-                        // Untrust — remove from trusted list of their room
-                        if (ImGui::SmallButton("Untrust")) {
-                            if (p->room_idx >= 0 && p->room_idx < s->db.n_rooms) {
-                                db_remove_trusted(&s->db.rooms[p->room_idx], p->ip);
-                                db_save(&s->db);
-                            }
-                        }
-
                         ImGui::PopID();
                     }
                 }
