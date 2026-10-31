@@ -411,7 +411,9 @@ static void print_help(void) {
     cmd_print("    unban <ip>                    - remove global ban");
     cmd_print("    unban room <code> <ip>        - remove room ban");
     cmd_print("    bans                          - list all bans");
+    cmd_print("    stats                         - traffic, security counters, link per player");
     cmd_print("    room create <code> [password] - create room");
+    cmd_print("    stats                         - traffic, security counters, per-player link");
     cmd_print("    setpw <code> <password>       - change room password");
     cmd_print("    log on|off                    - toggle packet logging");
     cmd_print("    quit                          - shutdown server");
@@ -595,6 +597,27 @@ void cli_dispatch(Server *s, const char *line) {
             any = 1;
         }
         if (!any) cmd_print("  (no bans)");
+        return;
+    }
+
+    // stats
+    if (strcmp(toks[0], "stats") == 0) {
+        const ServerStats *st = &s->stats;
+        cmd_print("  In %.1f MB (%llu packets), out %.1f MB (%llu packets)",
+                  (double)st->rx_bytes / 1e6, (unsigned long long)st->rx_packets,
+                  (double)st->tx_bytes / 1e6, (unsigned long long)st->tx_packets);
+        cmd_print("  Joined %llu, refused %llu, bad datagrams %llu",
+                  (unsigned long long)st->auth_ok, (unsigned long long)st->auth_refused,
+                  (unsigned long long)st->bad_datagrams);
+        cmd_print("  Hero violations %llu, player events dropped %llu",
+                  (unsigned long long)st->hero_violations, (unsigned long long)st->events_dropped);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            const Player *p = &s->players[i];
+            if (!p->used) continue;
+            cmd_print("  ID=%d '%s'%s rtt=%.0f ms resent=%u in=%.1f MB out=%.1f MB violations=%u",
+                      p->id, p->nick, p->is_sim ? " [sim]" : "", p->conn.srtt * 1000.0, p->conn.retransmits,
+                      (double)p->rx_bytes / 1e6, (double)p->tx_bytes / 1e6, p->violations);
+        }
         return;
     }
 

@@ -192,6 +192,8 @@ static int total_clients(Server *s) {
 
 // Only for the handshake, which happens before a session exists.
 static void server_send_raw(Server *s, const Addr *addr, const char *msg, int len) {
+    s->stats.tx_bytes += (uint64_t)len;
+    s->stats.tx_packets++;
     sendto(s->sock, msg, len, 0,
            (const struct sockaddr *)&addr->sa, sizeof(addr->sa));
 }
@@ -284,6 +286,7 @@ static void broadcast_online_count(Server *s, int room_idx, int count) {
 
 /* Send SRV_HELLO_FAIL: [0x29][0x00000000][reason_len(1)][reason ASCII] */
 static void send_hello_fail(Server *s, const Addr *addr, const uint8_t result_key[32], const char *reason) {
+    s->stats.auth_refused++;
     unsigned char buf[262];
     SRV_HDR_INIT(buf, SRV_HELLO_FAIL);
     int rlen = (int)strlen(reason);
@@ -869,6 +872,7 @@ static void handle_hs_auth(Server *s, const char *data, int len, const Addr *add
             send_online_count(s, &other->addr, count);
     }
 
+    s->stats.auth_ok++;
     send_ready(s, addr, result_key, pl->id, pl->session_token, pl->conn.conn_id);
     send_online_count(s, addr, count);
     // Known before the client loads a map, so it does not spawn enemies of its own.
@@ -940,6 +944,7 @@ static void session_join(Server *s, Player *pl) {
     Room *room = &s->rooms[pl->room_idx];
     unsigned char end[OL_HEADER_SIZE + 2];
     pl->in_world = 1;
+    pl->hero_known = 0;  // a new spawn point is not movement
     if (room->sim_owner == 0)
         sim_set_owner(s, pl->room_idx, pl->id);
     else
@@ -1226,9 +1231,158 @@ static void handle_claim_release(Server *s, Player *pl, const char *data, int le
     send_to_world(s, pl, (const char *)out, msg_len + 1);
 }
 
+// ---------------------------------------------------------------------------
+// Checks on what clients claim
+//
+// Movement and health stay on the client, which runs regeneration, Kismet damage and
+// everything else that changes them. Values that would harm a receiver are dropped;
+// implausible ones are only counted and logged, a laggy player must not get jerked around.
+// ---------------------------------------------------------------------------
+
+#define HERO_OFF_SMT        24
+#define HERO_OFF_HEALTH     32
+#define HERO_STATE_MIN      63     // DecodeBinaryState in HeroChannel.cpp
+#define HERO_SMT_MAX        100    // ESpecialMoveType in OLPawn.uc
+#define HERO_HEALTH_MAX     200
+#define HERO_HEALTH_JUMP    60     // more than regeneration or a pickup gives in one update
+#define HERO_SPEED_MAX      1500.f // uu/s, well above sprinting
+#define HERO_SPEED_SLACK    300.f  // uu, tolerated jitter between two updates
+#define WORLD_COORD_MAX     1.0e6f
+#define HITS_PER_SECOND     8
+#define HIT_ENEMY_RANGE     3000.f // uu, generous: positions of both sides lag
+
 static int read_i32(const char *p) {
     const unsigned char *b = (const unsigned char *)p;
     return (int)((uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
+}
+
+static float read_f32(const char *p) {
+    float f;
+    memcpy(&f, p, sizeof(f));  // both ends are little endian
+    return f;
+}
+
+static int coord_valid(float f) {
+    // Also false for NaN.
+    return f > -WORLD_COORD_MAX && f < WORLD_COORD_MAX;
+}
+
+static void hero_violation(Server *s, Player *pl, const char *what) {
+    double now = mono_now();
+    pl->violations++;
+    s->stats.hero_violations++;
+    if (now >= pl->next_violation_log) {
+        pl->next_violation_log = now + 5.0;
+        server_log(s, "[%s] ID=%d ('%s') %s (%u so far)", pl->ip, pl->id, pl->nick, what, pl->violations);
+    }
+}
+
+static int hero_state_accept(Server *s, Player *pl, const char *data, int len) {
+    const char *state = data + OL_HEADER_SIZE;
+    double now = mono_now();
+    float pos[3];
+    int i, smt, health;
+
+    if (len - OL_HEADER_SIZE < HERO_STATE_MIN) {
+        hero_violation(s, pl, "sent a truncated state");
+        return 0;
+    }
+    for (i = 0; i < 3; i++) {
+        pos[i] = read_f32(state + i * 4);
+        if (!coord_valid(pos[i])) {
+            hero_violation(s, pl, "sent an invalid position");
+            return 0;
+        }
+    }
+    smt = (unsigned char)state[HERO_OFF_SMT];
+    health = (short)((unsigned char)state[HERO_OFF_HEALTH] | ((unsigned char)state[HERO_OFF_HEALTH + 1] << 8));
+    if (smt > HERO_SMT_MAX || health > HERO_HEALTH_MAX) {
+        hero_violation(s, pl, "sent impossible values");
+        return 0;
+    }
+
+    if (pl->hero_known) {
+        // Special moves, cutscenes and respawns move the hero legitimately.
+        if (smt == 0 && health > 0) {
+            float dx = pos[0] - pl->hero_pos[0], dy = pos[1] - pl->hero_pos[1], dz = pos[2] - pl->hero_pos[2];
+            float allowed = HERO_SPEED_MAX * (float)(now - pl->hero_time) + HERO_SPEED_SLACK;
+            if (dx * dx + dy * dy + dz * dz > allowed * allowed)
+                hero_violation(s, pl, "moved faster than possible");
+        }
+        if (pl->hero_health > 0 && health - pl->hero_health > HERO_HEALTH_JUMP)
+            hero_violation(s, pl, "gained health too fast");
+    }
+    memcpy(pl->hero_pos, pos, sizeof(pos));
+    pl->hero_time = now;
+    pl->hero_health = health;
+    pl->hero_known = 1;
+    return 1;
+}
+
+static int enemy_near(Server *s, int room_idx, const float pos[3], float range) {
+    int i;
+    for (i = 0; i < MAX_ENEMY_SNAPSHOTS; i++) {
+        const EnemySnapshot *e = &s->enemies[i];
+        // loc_pkt: [header][name_len(1)][name][0][X][Y][Z]...
+        int at;
+        if (!e->used || e->room_idx != room_idx || e->loc_len <= OL_HEADER_SIZE) continue;
+        at = OL_HEADER_SIZE + 1 + (unsigned char)e->loc_pkt[OL_HEADER_SIZE] + 1;
+        if (at + 12 > e->loc_len) continue;
+        {
+            float dx = read_f32(e->loc_pkt + at) - pos[0];
+            float dy = read_f32(e->loc_pkt + at + 4) - pos[1];
+            float dz = read_f32(e->loc_pkt + at + 8) - pos[2];
+            if (dx * dx + dy * dy + dz * dz <= range * range) return 1;
+        }
+    }
+    return 0;
+}
+
+// [header][target_id LE4][event_type(1)]... The sender is already known to be the AI owner.
+// A false refusal costs one missed hit, a false acceptance lets a player owner hurt anyone.
+static int player_event_accept(Server *s, Player *pl, const char *data, int len) {
+    Player *target = NULL;
+    double now = mono_now();
+    int target_id, i;
+
+    if (len < OL_HEADER_SIZE + 5) return 0;
+    target_id = read_i32(data + OL_HEADER_SIZE);
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->id == target_id && p->room_idx == pl->room_idx && p->in_world && !p->is_sim)
+            target = p;
+    }
+    if (!target) {
+        s->stats.events_dropped++;
+        return 0;
+    }
+    if (now - target->hits_window >= 1.0) {
+        target->hits_window = now;
+        target->hits_this_second = 0;
+    }
+    if (++target->hits_this_second > HITS_PER_SECOND) {
+        s->stats.events_dropped++;
+        hero_violation(s, pl, "sent too many player events");
+        return 0;
+    }
+    // The simulator holds the server's secret; only a player acting as owner gets checked.
+    if (!pl->is_sim && target->hero_known && !enemy_near(s, pl->room_idx, target->hero_pos, HIT_ENEMY_RANGE)) {
+        s->stats.events_dropped++;
+        hero_violation(s, pl, "reported an attack with no enemy nearby");
+        return 0;
+    }
+    return 1;
+}
+
+// [header][name_len(1)][name][0][X][Y][Z]...
+static int enemy_loc_valid(const char *data, int len) {
+    int at, i;
+    if (len <= OL_HEADER_SIZE) return 0;
+    at = OL_HEADER_SIZE + 1 + (unsigned char)data[OL_HEADER_SIZE] + 1;
+    if (at + 12 > len) return 0;
+    for (i = 0; i < 3; i++)
+        if (!coord_valid(read_f32(data + at + i * 4))) return 0;
+    return 1;
 }
 
 // One message from an established session: [channel(1)][type(1)][player_id LE4][payload...]
@@ -1304,6 +1458,13 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
             }
             return;
         }
+
+        if (channel == CH_HERO && ptype == HERO_STATE && !hero_state_accept(s, pl, data, len))
+            return;
+        if (channel == CH_HERO && ptype == HERO_PLAYER_EVENT && !player_event_accept(s, pl, data, len))
+            return;
+        if (channel == CH_ENEMY && ptype == ENEMY_LOC && !enemy_loc_valid(data, len))
+            return;
 
         // CH_HERO: STATE snapshot
         if (channel == CH_HERO && ptype == HERO_STATE) {
@@ -1657,6 +1818,7 @@ static void transport_deliver(void *user, int lane, uint8_t *msg, int len) {
 
 static void transport_send(void *user, const uint8_t *datagram, int len) {
     TransportCtx *ctx = (TransportCtx *)user;
+    ctx->pl->tx_bytes += (uint64_t)len;
     server_send_raw(ctx->s, &ctx->pl->addr, (const char *)datagram, len);
 }
 
@@ -1671,6 +1833,8 @@ static Player *find_player_by_conn_id(Server *s, uint64_t conn_id) {
 
 void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
     if (len <= 0) return;
+    s->stats.rx_bytes += (uint64_t)len;
+    s->stats.rx_packets++;
 
     if ((unsigned char)data[0] == OL_MAGIC) {
         TransportCtx ctx;
@@ -1680,9 +1844,15 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
         ctx.s = s;
         ctx.from = addr;
         ctx.pl = find_player_by_conn_id(s, conn_id);
-        if (!ctx.pl) return;
-        if (!ol_conn_on_datagram(&ctx.pl->conn, now, (const uint8_t *)data, len, transport_deliver, &ctx))
+        if (!ctx.pl) {
+            s->stats.bad_datagrams++;
             return;
+        }
+        if (!ol_conn_on_datagram(&ctx.pl->conn, now, (const uint8_t *)data, len, transport_deliver, &ctx)) {
+            s->stats.bad_datagrams++;
+            return;
+        }
+        ctx.pl->rx_bytes += (uint64_t)len;
         // Follows NAT rebinding, also for a datagram that carried only acks.
         ctx.pl->addr = *addr;
         ctx.pl->last_seen = now;
@@ -1701,6 +1871,21 @@ void handle_packet(Server *s, const char *data, int len, const Addr *addr) {
 // ---------------------------------------------------------------------------
 // Background tasks
 // ---------------------------------------------------------------------------
+
+static void log_stats(Server *s) {
+    double now = mono_now();
+    int i, players = 0;
+    if (now < s->next_stats_log) return;
+    s->next_stats_log = now + 60.0;
+    for (i = 0; i < MAX_CLIENTS; i++)
+        if (s->players[i].used) players++;
+    if (players == 0) return;
+    server_log(s, "Stats: %d connected, in %.1f MB, out %.1f MB, joined %llu, refused %llu, bad datagrams %llu, violations %llu, events dropped %llu",
+               players, (double)s->stats.rx_bytes / 1e6, (double)s->stats.tx_bytes / 1e6,
+               (unsigned long long)s->stats.auth_ok, (unsigned long long)s->stats.auth_refused,
+               (unsigned long long)s->stats.bad_datagrams, (unsigned long long)s->stats.hero_violations,
+               (unsigned long long)s->stats.events_dropped);
+}
 
 void run_heartbeat(Server *s) {
     // No-op: server no longer sends heartbeat packets.
@@ -1794,6 +1979,7 @@ void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip
     double now = mono_now();
     s->next_heartbeat = now + HEARTBEAT_SEC;
     s->next_timeout   = now + HEARTBEAT_SEC;
+    s->next_stats_log = now + 60.0;
 
     history_push(s, "Listening on %s:%d  name='%s'", s->bind_ip, (int)s->port, s->name);
 }
@@ -1838,6 +2024,7 @@ void server_poll(Server *s) {
 
     run_heartbeat(s);
     run_timeout(s);
+    log_stats(s);
     server_drain_snaps(s);
     flush_players(s);
 }

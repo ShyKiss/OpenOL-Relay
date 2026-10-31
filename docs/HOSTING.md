@@ -35,3 +35,21 @@ podman run --replace -it \
   -p 7777:7777/udp \
   openol-relay:latest
 ```
+
+### Simulator secret
+
+A headless enemy AI process (`-simnode`) is admitted only if it proves it knows the secret in the
+relay's `OPENOL_SIM_SECRET` environment variable. Without the variable the relay refuses all simulators,
+and enemy AI runs on one of the players.
+
+```
+podman run -e OPENOL_SIM_SECRET="$(cat sim_secret.txt)" ...
+```
+
+Room passwords and this secret are never sent over the network; all traffic is encrypted. Old game
+versions cannot connect to this relay: the handshake changed.
+
+### Monitoring
+
+The `stats` command and the GUI's Stats tab show traffic, refused joins, datagrams that failed
+authentication, and per player RTT, resends and rule violations. The log gets a summary every minute.

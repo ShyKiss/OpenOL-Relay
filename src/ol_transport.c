@@ -175,6 +175,7 @@ void ol_conn_flush(OlConn *c, double now, OlSendFn send, void *user) {
                     put16(p + n + 3, m->len);
                     memcpy(p + n + 5, m->data, m->len);
                     n += 5 + m->len;
+                    if (m->attempts) c->retransmits++;
                     m->attempts++;
                     m->last_sent = now;
                     added++;

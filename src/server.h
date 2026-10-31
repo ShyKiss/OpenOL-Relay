@@ -323,6 +323,18 @@ typedef struct {
     int      in_world;            // receives and sends world traffic
     int      is_sim;              // headless simulator: runs enemy AI, players never see it
     uint8_t  hs_client_pub[32];   // key of the handshake behind this session
+    // Hero checks: last accepted state.
+    int      hero_known;
+    float    hero_pos[3];
+    double   hero_time;
+    int      hero_health;
+    int      hits_this_second;
+    double   hits_window;
+    double   next_violation_log;
+    // Metrics
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint32_t violations;
 } Player;
 
 // ---------------------------------------------------------------------------
@@ -330,6 +342,19 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 #define MAX_LOG_LINES   2000
+
+// Totals since the server started.
+typedef struct {
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t rx_packets;
+    uint64_t tx_packets;
+    uint64_t auth_ok;
+    uint64_t auth_refused;
+    uint64_t bad_datagrams;   // failed authentication or replay
+    uint64_t hero_violations;
+    uint64_t events_dropped;
+} ServerStats;
 
 typedef struct {
     sock_t         sock;
@@ -349,6 +374,8 @@ typedef struct {
     double         next_timeout;
     double         next_snap_drain;
     double         next_flush;
+    ServerStats    stats;
+    double         next_stats_log;
     OlHsServer     hs;
     char           sim_secret[128];   // OPENOL_SIM_SECRET; empty means no simulators
     char           name[64];

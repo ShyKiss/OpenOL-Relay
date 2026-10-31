@@ -60,6 +60,8 @@ typedef struct {
     uint8_t  in_got[OL_WINDOW];
     uint16_t in_next;
 
+    uint32_t retransmits;              /* reliable messages sent more than once */
+
     uint16_t send_seq;
     uint16_t recv_seq;
     uint8_t  have_recv;

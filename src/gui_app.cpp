@@ -467,6 +467,44 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
         }
 
         // ---- Rooms tab ----
+        if (ImGui::BeginTabItem("Stats")) {
+            if (!srv) {
+                ImGui::TextUnformatted("Server is not running");
+            } else {
+                const ServerStats &st = s->stats;
+                ImGui::Text("In %.1f MB (%llu packets), out %.1f MB (%llu packets)",
+                            (double)st.rx_bytes / 1e6, (unsigned long long)st.rx_packets,
+                            (double)st.tx_bytes / 1e6, (unsigned long long)st.tx_packets);
+                ImGui::Text("Joined %llu, refused %llu, bad datagrams %llu",
+                            (unsigned long long)st.auth_ok, (unsigned long long)st.auth_refused,
+                            (unsigned long long)st.bad_datagrams);
+                ImGui::Text("Hero violations %llu, player events dropped %llu",
+                            (unsigned long long)st.hero_violations, (unsigned long long)st.events_dropped);
+                if (ImGui::BeginTable("link", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Player");
+                    ImGui::TableSetupColumn("RTT, ms");
+                    ImGui::TableSetupColumn("Resent");
+                    ImGui::TableSetupColumn("In, MB");
+                    ImGui::TableSetupColumn("Out, MB");
+                    ImGui::TableSetupColumn("Violations");
+                    ImGui::TableHeadersRow();
+                    for (int i = 0; i < MAX_CLIENTS; i++) {
+                        const Player *p = &s->players[i];
+                        if (!p->used) continue;
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn(); ImGui::Text("%s%s", p->nick, p->is_sim ? " [sim]" : "");
+                        ImGui::TableNextColumn(); ImGui::Text("%.0f", p->conn.srtt * 1000.0);
+                        ImGui::TableNextColumn(); ImGui::Text("%u", p->conn.retransmits);
+                        ImGui::TableNextColumn(); ImGui::Text("%.1f", (double)p->rx_bytes / 1e6);
+                        ImGui::TableNextColumn(); ImGui::Text("%.1f", (double)p->tx_bytes / 1e6);
+                        ImGui::TableNextColumn(); ImGui::Text("%u", p->violations);
+                    }
+                    ImGui::EndTable();
+                }
+            }
+            ImGui::EndTabItem();
+        }
+
         if (ImGui::BeginTabItem("Rooms")) {
             // Add room row
             static char r_code[DB_ROOM_CODE_LEN] = {};
