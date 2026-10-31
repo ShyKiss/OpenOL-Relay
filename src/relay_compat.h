@@ -7,6 +7,10 @@
 =============================================================================*/
 #pragma once
 
+#ifdef __MINGW32__
+#include <ws2tcpip.h>
+#endif
+
 #if defined(_MSC_VER) && _MSC_VER < 1900
 
 #include <stdio.h>
