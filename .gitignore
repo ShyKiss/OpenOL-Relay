@@ -1,5 +1,6 @@
-build/*
-dist/*
-build_win/*
+build/
+dist/
+obj/
+build_win/
 .gitignore
 build_win.sh
