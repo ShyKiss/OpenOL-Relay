@@ -5,6 +5,7 @@
 #include "openol_protocol.h"
 #include "third_party/monocypher/monocypher.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -23,8 +24,12 @@
 #define OL_AUTH_COOKIE (OL_AUTH_PUB + 32)
 #define OL_AUTH_MAC   (OL_AUTH_COOKIE + 16)
 #define OL_AUTH_SEALED (OL_AUTH_MAC + 16)
-#define OL_RESULT_MAC 2
+#define OL_RESULT_PUB 2
+#define OL_RESULT_MAC (OL_RESULT_PUB + 32)
 #define OL_RESULT_SEALED (OL_RESULT_MAC + 16)
+
+#define OL_ARGON2_BLOCKS 16384  /* 1 KB each */
+#define OL_ARGON2_PASSES 3
 /* role + proof + has_token + token + room_len */
 #define OL_AUTH_FIXED (1 + 32 + 1 + 32 + 1)
 
@@ -47,36 +52,74 @@ static void derive_key(uint8_t out[32], const uint8_t root[32], const char *labe
     crypto_blake2b_keyed(out, 32, root, 32, (const uint8_t *)label, strlen(label));
 }
 
-/* Both sides mix in the two public keys, so each session gets its own keys. */
-static void derive_session(const uint8_t shared[32], const uint8_t client_pub[32], const uint8_t server_pub[32],
-                           uint8_t root[32], uint8_t auth_key[32], uint8_t c2s[32], uint8_t s2c[32], uint8_t result[32]) {
+static int is_zero32(const uint8_t v[32]) {
+    static const uint8_t zero[32] = {0};
+    return crypto_verify32(v, zero) == 0;
+}
+
+/* Both sides mix in the two public keys, so each handshake gets its own keys. */
+static void derive_handshake(const uint8_t shared[32], const uint8_t client_pub[32], const uint8_t server_pub[32],
+                             uint8_t root[32], uint8_t auth_key[32], uint8_t result[32]) {
     uint8_t in[96];
     memcpy(in, shared, 32);
     memcpy(in + 32, client_pub, 32);
     memcpy(in + 64, server_pub, 32);
     crypto_blake2b(root, 32, in, sizeof(in));
     derive_key(auth_key, root, "openol auth");
-    derive_key(c2s, root, "openol c2s");
-    derive_key(s2c, root, "openol s2c");
     derive_key(result, root, "openol result");
     crypto_wipe(in, sizeof(in));
 }
 
-static void make_proof(uint8_t out[32], const uint8_t root[32], const uint8_t cookie[16], const char *secret) {
-    uint8_t key[32];
+/* Forward secrecy: session_shared comes from keys that exist for this session only. */
+static void derive_session(const uint8_t root[32], const uint8_t session_shared[32], uint8_t c2s[32], uint8_t s2c[32]) {
+    uint8_t in[64], key[32];
+    memcpy(in, root, 32);
+    memcpy(in + 32, session_shared, 32);
+    crypto_blake2b(key, 32, in, sizeof(in));
+    derive_key(c2s, key, "openol c2s");
+    derive_key(s2c, key, "openol s2c");
+    crypto_wipe(in, sizeof(in));
+    crypto_wipe(key, sizeof(key));
+}
+
+static void make_proof_key(uint8_t out[32], const uint8_t root[32], const uint8_t cookie[16], const uint8_t key[32]) {
     uint8_t in[48];
-    crypto_blake2b(key, 32, (const uint8_t *)secret, strlen(secret));
     memcpy(in, root, 32);
     memcpy(in + 32, cookie, 16);
     crypto_blake2b_keyed(out, 32, key, 32, in, sizeof(in));
-    crypto_wipe(key, sizeof(key));
     crypto_wipe(in, sizeof(in));
+}
+
+static void secret_key(uint8_t out[32], const char *secret) {
+    crypto_blake2b(out, 32, (const uint8_t *)secret, strlen(secret));
+}
+
+int ol_password_key(const uint8_t server_pub[32], const char *password, uint8_t out[32]) {
+    crypto_argon2_config config;
+    crypto_argon2_inputs inputs;
+    void *work = malloc((size_t)OL_ARGON2_BLOCKS * 1024);
+    if (!work) return 0;
+    config.algorithm = CRYPTO_ARGON2_ID;
+    config.nb_blocks = OL_ARGON2_BLOCKS;
+    config.nb_passes = OL_ARGON2_PASSES;
+    config.nb_lanes  = 1;
+    inputs.pass = (const uint8_t *)password;
+    inputs.pass_size = (uint32_t)strlen(password);
+    inputs.salt = server_pub;
+    inputs.salt_size = 32;
+    crypto_argon2(out, 32, work, config, inputs, crypto_argon2_no_extras);
+    free(work);
+    return 1;
 }
 
 /* The keys are single-use or the message is an exact retransmission. */
 static const uint8_t k_zero_nonce[24] = {0};
 
 /* --- client --- */
+
+const uint8_t *ol_hs_challenge_key(const uint8_t *challenge) {
+    return challenge + OL_CHAL_PUB;
+}
 
 void ol_hs_client_hello(uint8_t out[OL_HS_HELLO_BYTES]) {
     memset(out, 0, OL_HS_HELLO_BYTES);
@@ -86,18 +129,22 @@ void ol_hs_client_hello(uint8_t out[OL_HS_HELLO_BYTES]) {
 
 int ol_hs_client_auth(OlHsClient *hs, const uint8_t *challenge, int len, const char *room,
                       const char *secret, int role, const uint8_t *token, uint8_t *out) {
-    uint8_t priv[32], pub[32], shared[32], root[32], auth_key[32];
+    uint8_t pub[32], shared[32], auth_key[32], key[32];
     uint8_t *plain = out + OL_AUTH_SEALED;
     int room_len = (int)strlen(room);
     int plain_len = OL_AUTH_FIXED + room_len;
 
     if (len != OL_HS_CHALLENGE_BYTES || challenge[0] != OL_HS_CHALLENGE || challenge[1] != OL_HS_VERSION) return 0;
     if (room_len >= OL_HS_ROOM_MAX || OL_AUTH_SEALED + plain_len > OL_HS_AUTH_MAX) return 0;
-    if (!ol_random(priv, sizeof(priv))) return 0;
+    if (!ol_random(hs->secret, 32)) return 0;
 
-    crypto_x25519_public_key(pub, priv);
-    crypto_x25519(shared, priv, challenge + OL_CHAL_PUB);
-    derive_session(shared, pub, challenge + OL_CHAL_PUB, root, auth_key, hs->c2s_key, hs->s2c_key, hs->result_key);
+    crypto_x25519_public_key(pub, hs->secret);
+    crypto_x25519(shared, hs->secret, challenge + OL_CHAL_PUB);
+    if (is_zero32(shared)) return 0;  /* a low-order key would make the result predictable */
+    derive_handshake(shared, pub, challenge + OL_CHAL_PUB, hs->root, auth_key, hs->result_key);
+
+    if (role == OL_ROLE_SIM || !secret[0]) secret_key(key, secret);
+    else if (!ol_password_key(challenge + OL_CHAL_PUB, secret, key)) return 0;
 
     out[0] = OL_HS_AUTH;
     out[1] = OL_HS_VERSION;
@@ -105,7 +152,8 @@ int ol_hs_client_auth(OlHsClient *hs, const uint8_t *challenge, int len, const c
     memcpy(out + OL_AUTH_COOKIE, challenge + OL_CHAL_COOKIE, 16);
 
     plain[0] = (uint8_t)role;
-    make_proof(plain + 1, root, challenge + OL_CHAL_COOKIE, secret);
+    make_proof_key(plain + 1, hs->root, challenge + OL_CHAL_COOKIE, key);
+    crypto_wipe(key, sizeof(key));
     plain[33] = token ? 1 : 0;
     if (token) memcpy(plain + 34, token, 32);
     else       memset(plain + 34, 0, 32);
@@ -114,27 +162,35 @@ int ol_hs_client_auth(OlHsClient *hs, const uint8_t *challenge, int len, const c
 
     crypto_aead_lock(plain, out + OL_AUTH_MAC, auth_key, k_zero_nonce, out, OL_AUTH_MAC, plain, plain_len);
 
-    crypto_wipe(priv, sizeof(priv));
     crypto_wipe(shared, sizeof(shared));
-    crypto_wipe(root, sizeof(root));
     crypto_wipe(auth_key, sizeof(auth_key));
     return OL_AUTH_SEALED + plain_len;
 }
 
-int ol_hs_client_result(const OlHsClient *hs, const uint8_t *data, int len, uint8_t *msg) {
+int ol_hs_client_result(OlHsClient *hs, const uint8_t *data, int len, uint8_t *msg) {
+    uint8_t shared[32];
     int msg_len = len - OL_RESULT_SEALED;
     if (msg_len <= 0 || msg_len > OL_HS_RESULT_MAX) return 0;
     if (data[0] != OL_HS_RESULT || data[1] != OL_HS_VERSION) return 0;
     if (crypto_aead_unlock(msg, data + OL_RESULT_MAC, hs->result_key, k_zero_nonce,
                            data, OL_RESULT_MAC, data + OL_RESULT_SEALED, msg_len) != 0)
         return 0;
+    /* A refusal carries no session key. */
+    if (!is_zero32(data + OL_RESULT_PUB)) {
+        crypto_x25519(shared, hs->secret, data + OL_RESULT_PUB);
+        if (is_zero32(shared)) return 0;
+        derive_session(hs->root, shared, hs->c2s_key, hs->s2c_key);
+        crypto_wipe(shared, sizeof(shared));
+    }
     return msg_len;
 }
 
 /* --- server --- */
 
-int ol_hs_server_init(OlHsServer *hs) {
-    if (!ol_random(hs->secret, 32) || !ol_random(hs->cookie_key, 32)) return 0;
+int ol_hs_server_init(OlHsServer *hs, const uint8_t *secret) {
+    if (secret) memcpy(hs->secret, secret, 32);
+    else if (!ol_random(hs->secret, 32)) return 0;
+    if (!ol_random(hs->cookie_key, 32)) return 0;
     crypto_x25519_public_key(hs->pub, hs->secret);
     return 1;
 }
@@ -181,8 +237,8 @@ int ol_hs_server_auth(const OlHsServer *hs, const void *who, int who_len, uint32
     memcpy(auth->client_pub, data + OL_AUTH_PUB, 32);
     memcpy(auth->cookie, data + OL_AUTH_COOKIE, 16);
     crypto_x25519(shared, hs->secret, auth->client_pub);
-    derive_session(shared, auth->client_pub, hs->pub, auth->root, auth_key,
-                   auth->c2s_key, auth->s2c_key, auth->result_key);
+    if (is_zero32(shared)) return 0;
+    derive_handshake(shared, auth->client_pub, hs->pub, auth->root, auth_key, auth->result_key);
     ok = crypto_aead_unlock(plain, data + OL_AUTH_MAC, auth_key, k_zero_nonce,
                             data, OL_AUTH_MAC, data + OL_AUTH_SEALED, plain_len) == 0;
     crypto_wipe(shared, sizeof(shared));
@@ -200,19 +256,42 @@ int ol_hs_server_auth(const OlHsServer *hs, const void *who, int who_len, uint32
     return 1;
 }
 
-int ol_hs_proof_ok(const OlHsAuth *auth, const char *secret) {
+int ol_hs_proof_ok_key(const OlHsAuth *auth, const uint8_t key[32]) {
     uint8_t expected[32];
     int ok;
-    make_proof(expected, auth->root, auth->cookie, secret);
+    make_proof_key(expected, auth->root, auth->cookie, key);
     ok = crypto_verify32(expected, auth->proof) == 0;
     crypto_wipe(expected, sizeof(expected));
     return ok;
 }
 
-int ol_hs_server_result(const uint8_t result_key[32], const void *msg, int msg_len, uint8_t *out) {
+int ol_hs_proof_ok_secret(const OlHsAuth *auth, const char *secret) {
+    uint8_t key[32];
+    int ok;
+    secret_key(key, secret);
+    ok = ol_hs_proof_ok_key(auth, key);
+    crypto_wipe(key, sizeof(key));
+    return ok;
+}
+
+int ol_hs_server_session(OlHsAuth *auth, uint8_t session_pub[32]) {
+    uint8_t secret[32], shared[32];
+    if (!ol_random(secret, sizeof(secret))) return 0;
+    crypto_x25519_public_key(session_pub, secret);
+    crypto_x25519(shared, secret, auth->client_pub);
+    derive_session(auth->root, shared, auth->c2s_key, auth->s2c_key);
+    crypto_wipe(secret, sizeof(secret));
+    crypto_wipe(shared, sizeof(shared));
+    return 1;
+}
+
+int ol_hs_server_result(const uint8_t result_key[32], const uint8_t *session_pub,
+                        const void *msg, int msg_len, uint8_t *out) {
     if (msg_len <= 0 || msg_len > OL_HS_RESULT_MAX - OL_RESULT_SEALED) return 0;
     out[0] = OL_HS_RESULT;
     out[1] = OL_HS_VERSION;
+    if (session_pub) memcpy(out + OL_RESULT_PUB, session_pub, 32);
+    else             memset(out + OL_RESULT_PUB, 0, 32);
     memcpy(out + OL_RESULT_SEALED, msg, msg_len);
     crypto_aead_lock(out + OL_RESULT_SEALED, out + OL_RESULT_MAC, result_key, k_zero_nonce,
                      out, OL_RESULT_MAC, out + OL_RESULT_SEALED, msg_len);

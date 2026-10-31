@@ -493,7 +493,7 @@ void cli_dispatch(Server *s, const char *line) {
             int count   = server_room_player_count(s, ri);
             DBRoom *dr  = db_find_room(&s->db, r->code);
             int n_bans  = dr ? dr->n_bans    : 0;
-            const char *pw = r->password[0] ? r->password : "(no password)";
+            const char *pw = r->password[0] ? "(set)" : "(no password)";
             cmd_print("  '%s': %d player(s)  password=%s  bans=%d",
                       r->code, count, pw, n_bans);
         }
@@ -603,6 +603,7 @@ void cli_dispatch(Server *s, const char *line) {
     // stats
     if (strcmp(toks[0], "stats") == 0) {
         const ServerStats *st = &s->stats;
+        cmd_print("  Server key: %s", s->hs_pub_hex);
         cmd_print("  In %.1f MB (%llu packets), out %.1f MB (%llu packets)",
                   (double)st->rx_bytes / 1e6, (unsigned long long)st->rx_packets,
                   (double)st->tx_bytes / 1e6, (unsigned long long)st->tx_packets);

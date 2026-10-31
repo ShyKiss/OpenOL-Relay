@@ -13,7 +13,7 @@
 #define DB_MAX_TRUSTED        256   // per room
 #define DB_MAX_BANS           512   // per room (and global)
 #define DB_ROOM_CODE_LEN      33
-#define DB_PASSWORD_LEN       64
+#define DB_PASSWORD_LEN       80
 #define DB_IP_LEN             46
 #define DB_NICK_LEN           33
 #define DB_REASON_LEN         128

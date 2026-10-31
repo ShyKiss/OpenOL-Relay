@@ -71,6 +71,11 @@ static void gui_server_start(Server *s, volatile int *running, DB *db) {
     if (s->n_rooms == 0)
         server_add_room(s, "PUBLIC", "");
 
+    // This copy gets saved too: it must not bring plain passwords back to the file.
+    for (int i = 0; i < s->n_rooms; i++)
+        db_update_room_password(db, s->rooms[i].code, s->rooms[i].password);
+    db_save(db);
+
     log_hook(("Server started on " + std::string(db->config.bind_ip) +
               ":" + std::to_string(db->config.port)).c_str());
 
@@ -520,8 +525,11 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
                 db_add_room(db, r_code, r_pass);
                 db_save(db);
                 if (srv) {
-                    db_add_room(&s->db, r_code, r_pass);
-                    server_add_room(s, r_code, r_pass);
+                    Room *added = server_add_room(s, r_code, r_pass);
+                    if (added) {
+                        db_update_room_password(db, r_code, added->password);
+                        db_save(db);
+                    }
                 }
                 r_code[0] = '\0';
                 r_pass[0] = '\0';
@@ -580,24 +588,20 @@ static void draw_frame(Server *s, volatile int *running, DB *db,
 
                     // --- Password cell (always editable, masked unless hovered/active) ---
                     ImGui::TableNextColumn();
-                    if (!pass_editing[i]) {
-                        const char *cur = sr ? sr->password : (dr ? dr->password : "");
-                        strncpy(edit_pass[i], cur, MAX_PASSWORD - 1);
-                    }
                     {
-                        // Show password masked unless hovered or active (one-frame lag is fine).
-                        static bool pass_hovered[MAX_ROOMS] = {};
-                        ImGuiInputTextFlags pass_flags = ImGuiInputTextFlags_EnterReturnsTrue;
-                        if (!pass_hovered[i] && !pass_editing[i])
-                            pass_flags |= ImGuiInputTextFlags_Password;
+                        // Only a hash is stored, so there is nothing to show: type a new password,
+                        // Enter applies it, Enter on an empty field removes it.
+                        const char *cur = sr ? sr->password : (dr ? dr->password : "");
                         ImGui::SetNextItemWidth(-1);
-                        if (ImGui::InputText("##pass", edit_pass[i], MAX_PASSWORD, pass_flags)) {
-                            if (sr) strncpy(sr->password, edit_pass[i], MAX_PASSWORD - 1);
-                            if (dr) strncpy(dr->password, edit_pass[i], DB_PASSWORD_LEN - 1);
+                        if (ImGui::InputTextWithHint("##pass", cur[0] ? "(set)" : "(none)", edit_pass[i], MAX_PASSWORD,
+                                                     ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_Password)) {
+                            if (sr) server_set_room_password(s, sr, edit_pass[i]);
+                            // A stopped server hashes this on its next start.
+                            if (dr) strncpy(dr->password, sr ? sr->password : edit_pass[i], DB_PASSWORD_LEN - 1);
                             db_save(live_db);
+                            edit_pass[i][0] = '\0';
                         }
                         pass_editing[i] = ImGui::IsItemActive();
-                        pass_hovered[i] = ImGui::IsItemHovered();
                     }
 
                     // --- Players cell ---

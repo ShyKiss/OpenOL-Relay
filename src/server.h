@@ -95,7 +95,7 @@ static inline double mono_now() {
 #define MAX_ROOMS       64
 #define MAX_ROOM_CODE   33
 #define MAX_NICK        33
-#define MAX_PASSWORD    64
+#define MAX_PASSWORD    80   // stored form: OL_PASSWORD_PREFIX + 64 hex digits
 #define MAX_IP          46      // IPv6 max
 #define MAX_WORLD_NAME  128
 
@@ -323,6 +323,7 @@ typedef struct {
     int      in_world;            // receives and sends world traffic
     int      is_sim;              // headless simulator: runs enemy AI, players never see it
     uint8_t  hs_client_pub[32];   // key of the handshake behind this session
+    uint8_t  hs_session_pub[32];  // repeated if the client did not hear the answer
     // Hero checks: last accepted state.
     int      hero_known;
     float    hero_pos[3];
@@ -377,6 +378,7 @@ typedef struct {
     ServerStats    stats;
     double         next_stats_log;
     OlHsServer     hs;
+    char           hs_pub_hex[65];
     char           sim_secret[128];   // OPENOL_SIM_SECRET; empty means no simulators
     char           name[64];
     int            player_id_seq; // monotonic counter for next_player_id

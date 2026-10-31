@@ -82,22 +82,75 @@ Room *server_find_room(Server *s, const char *code) {
     return NULL;
 }
 
+#define OL_PASSWORD_PREFIX "$ol1$"
+
+static void hex_encode(char *out, const uint8_t *in, int len) {
+    static const char digits[] = "0123456789abcdef";
+    int i;
+    for (i = 0; i < len; i++) {
+        out[i * 2]     = digits[in[i] >> 4];
+        out[i * 2 + 1] = digits[in[i] & 15];
+    }
+    out[len * 2] = '\0';
+}
+
+static int hex_decode(const char *in, uint8_t *out, int len) {
+    int i;
+    for (i = 0; i < len; i++) {
+        unsigned value;
+        if (!in[i * 2] || !in[i * 2 + 1] || sscanf(in + i * 2, "%2x", &value) != 1) return 0;
+        out[i] = (uint8_t)value;
+    }
+    return 1;
+}
+
+// Rooms never keep a password in memory or on disk, only what proves it. Values already
+// in this form come from the database; anything else, from an admin or an old file, is new.
+static void room_password_store(Server *s, const char *password, char out[MAX_PASSWORD]) {
+    size_t prefix = strlen(OL_PASSWORD_PREFIX);
+    uint8_t key[32];
+    out[0] = '\0';
+    if (!password[0]) return;
+    if (strncmp(password, OL_PASSWORD_PREFIX, prefix) == 0) {
+        strncpy(out, password, MAX_PASSWORD - 1);
+        out[MAX_PASSWORD - 1] = '\0';
+    } else if (ol_password_key(s->hs.pub, password, key)) {
+        strcpy(out, OL_PASSWORD_PREFIX);
+        hex_encode(out + prefix, key, 32);
+    } else {
+        // Out of memory: the room must not silently become open.
+        snprintf(out, MAX_PASSWORD, "%s!", OL_PASSWORD_PREFIX);
+    }
+}
+
+static int room_password_ok(const Room *room, const OlHsAuth *auth) {
+    uint8_t key[32];
+    size_t prefix = strlen(OL_PASSWORD_PREFIX);
+    if (strncmp(room->password, OL_PASSWORD_PREFIX, prefix) != 0 || !hex_decode(room->password + prefix, key, 32))
+        return 0;
+    return ol_hs_proof_ok_key(auth, key);
+}
+
 Room *server_add_room(Server *s, const char *code, const char *password) {
     if (s->n_rooms >= MAX_ROOMS) return NULL;
     Room *r = &s->rooms[s->n_rooms++];
     memset(r, 0, sizeof(*r));
     strncpy(r->code,     code,     MAX_ROOM_CODE - 1);
-    strncpy(r->password, password, MAX_PASSWORD  - 1);
+    room_password_store(s, password, r->password);
     r->active = 1;
     // Mirror into DB so trusted/bans are always accessible
-    db_add_room(&s->db, code, password);
+    db_add_room(&s->db, code, r->password);
+    // An old database held the password itself; this replaces it on disk.
+    if (strcmp(password, r->password) != 0) {
+        db_update_room_password(&s->db, code, r->password);
+        db_save(&s->db);
+    }
     return r;
 }
 
 // Change room password. Clears trusted IPs in DB.
 void server_set_room_password(Server *s, Room *r, const char *password) {
-    strncpy(r->password, password ? password : "", MAX_PASSWORD - 1);
-    r->password[MAX_PASSWORD - 1] = '\0';
+    room_password_store(s, password ? password : "", r->password);
     DBRoom *dr = db_find_room(&s->db, r->code);
     if (dr) {
         strncpy(dr->password, r->password, DB_PASSWORD_LEN - 1);
@@ -198,9 +251,10 @@ static void server_send_raw(Server *s, const Addr *addr, const char *msg, int le
            (const struct sockaddr *)&addr->sa, sizeof(addr->sa));
 }
 
-static void send_sealed(Server *s, const Addr *addr, const uint8_t result_key[32], const void *msg, int len) {
+static void send_sealed(Server *s, const Addr *addr, const uint8_t result_key[32], const uint8_t *session_pub,
+                        const void *msg, int len) {
     uint8_t out[OL_HS_RESULT_MAX];
-    int n = ol_hs_server_result(result_key, msg, len, out);
+    int n = ol_hs_server_result(result_key, session_pub, msg, len, out);
     if (n > 0)
         server_send_raw(s, addr, (const char *)out, n);
 }
@@ -246,7 +300,7 @@ void server_broadcast_room(Server *s, int room_idx, const char *msg, int len) {
 /* Send SRV_READY: [type(1)][pad(4)][player_id LE4][name_len(1)][name...][token(32)]
  * token — 32-byte session token for NAT rebind identification (echoed in HELLO).
  * conn_id — identifies this session in every later datagram. */
-static void send_ready(Server *s, const Addr *addr, const uint8_t result_key[32], int player_id, const uint8_t token[32], uint64_t conn_id) {
+static void send_ready(Server *s, const Addr *addr, const uint8_t result_key[32], const uint8_t session_pub[32], int player_id, const uint8_t token[32], uint64_t conn_id) {
     unsigned char buf[306]; /* 5 hdr + 4 id + 1 namelen + 255 name + 32 token + 8 conn_id */
     int ci;
     SRV_HDR_INIT(buf, SRV_READY);
@@ -261,7 +315,7 @@ static void send_ready(Server *s, const Addr *addr, const uint8_t result_key[32]
     memcpy(buf + 10 + name_len, token, 32);
     for (ci = 0; ci < 8; ci++)
         buf[10 + name_len + 32 + ci] = (unsigned char)(conn_id >> (8 * ci));
-    send_sealed(s, addr, result_key, buf, 10 + name_len + 32 + 8);
+    send_sealed(s, addr, result_key, session_pub, buf, 10 + name_len + 32 + 8);
 }
 
 /* Send SRV_ONLINE_COUNT: [0x28][0x00000000][count LE4] */
@@ -293,7 +347,7 @@ static void send_hello_fail(Server *s, const Addr *addr, const uint8_t result_ke
     if (rlen > 255) rlen = 255;
     buf[5] = (unsigned char)rlen;
     memcpy(buf + 6, reason, rlen);
-    send_sealed(s, addr, result_key, buf, 6 + rlen);
+    send_sealed(s, addr, result_key, NULL, buf, 6 + rlen);
 }
 
 /* Send SRV_DISCONNECT: [0x2A][0x00000000][player_id LE4] */
@@ -776,7 +830,7 @@ static void handle_hs_auth(Server *s, const char *data, int len, const Addr *add
     if (is_sim) {
         // Whoever owns the AI decides what enemies do to players, so a room password is not enough.
         Player *node = sim_node(s, room_idx);
-        if (!s->sim_secret[0] || !ol_hs_proof_ok(&auth, s->sim_secret)) {
+        if (!s->sim_secret[0] || !ol_hs_proof_ok_secret(&auth, s->sim_secret)) {
             server_log(s, "[%s] refused as simulator: wrong secret", client_ip);
             send_hello_fail(s, addr, result_key, "simulator not allowed");
             return;
@@ -785,21 +839,24 @@ static void handle_hs_auth(Server *s, const char *data, int len, const Addr *add
             send_hello_fail(s, addr, result_key, "room already has a simulator");
             return;
         }
-    } else if (room->password[0] && !ol_hs_proof_ok(&auth, room->password)) {
+    } else if (room->password[0] && !room_password_ok(room, &auth)) {
         send_hello_fail(s, addr, result_key, "wrong password");
         return;
     }
 
     Player *pl = NULL;
+    uint8_t session_pub[32];
     for (int i = 0; i < MAX_CLIENTS && !pl; i++) {
         Player *p = &s->players[i];
         if (p->used && memcmp(p->hs_client_pub, auth.client_pub, 32) == 0) {
             // Our answer got lost and the client repeated itself: same session, same keys.
             p->addr = *addr;
-            send_ready(s, addr, result_key, p->id, p->session_token, p->conn.conn_id);
+            send_ready(s, addr, result_key, p->hs_session_pub, p->id, p->session_token, p->conn.conn_id);
             return;
         }
     }
+
+    if (!ol_hs_server_session(&auth, session_pub)) return;
 
     // The token is the only way to take over a session that is already in use.
     if (auth.has_token) {
@@ -819,11 +876,12 @@ static void handle_hs_auth(Server *s, const char *data, int len, const Addr *add
         pl->addr = *addr;
         pl->is_sim = is_sim;
         memcpy(pl->hs_client_pub, auth.client_pub, 32);
+        memcpy(pl->hs_session_pub, session_pub, 32);
         count = server_room_player_count(s, pl->room_idx);
         // The client starts a fresh transport session for every handshake.
         ol_conn_reset(&pl->conn, gen_conn_id());
         ol_conn_set_keys(&pl->conn, auth.s2c_key, auth.c2s_key);
-        send_ready(s, addr, result_key, pl->id, pl->session_token, pl->conn.conn_id);
+        send_ready(s, addr, result_key, session_pub, pl->id, pl->session_token, pl->conn.conn_id);
         send_online_count(s, addr, count);
         if (room->sim_owner != 0)
             send_sim_owner(pl, room->sim_owner);
@@ -856,6 +914,7 @@ static void handle_hs_auth(Server *s, const char *data, int len, const Addr *add
     snprintf(pl->nick, sizeof(pl->nick), "Player%d", pl->id);
     pl->is_sim    = is_sim;
     memcpy(pl->hs_client_pub, auth.client_pub, 32);
+    memcpy(pl->hs_session_pub, session_pub, 32);
     gen_session_token(pl->session_token);
     ol_conn_reset(&pl->conn, gen_conn_id());
     ol_conn_set_keys(&pl->conn, auth.s2c_key, auth.c2s_key);
@@ -873,7 +932,7 @@ static void handle_hs_auth(Server *s, const char *data, int len, const Addr *add
     }
 
     s->stats.auth_ok++;
-    send_ready(s, addr, result_key, pl->id, pl->session_token, pl->conn.conn_id);
+    send_ready(s, addr, result_key, session_pub, pl->id, pl->session_token, pl->conn.conn_id);
     send_online_count(s, addr, count);
     // Known before the client loads a map, so it does not spawn enemies of its own.
     if (room->sim_owner != 0)
@@ -1913,6 +1972,43 @@ void run_timeout(Server *s) {
 // Init / run / shutdown
 // ---------------------------------------------------------------------------
 
+// Clients pin this key, so it has to survive restarts: "<database>.key", 64 hex digits.
+// Without keys nobody could connect safely, so there is nothing to fall back to.
+static void load_server_key(Server *s, const char *db_path) {
+    char path[512], hex[65] = {0};
+    uint8_t secret[32];
+    int loaded = 0;
+    FILE *f;
+    snprintf(path, sizeof(path), "%s.key", db_path);
+    f = fopen(path, "r");
+    if (f) {
+        loaded = fread(hex, 1, 64, f) == 64 && hex_decode(hex, secret, 32);
+        fclose(f);
+        if (!loaded)
+            fprintf(stderr, "Server key file %s is damaged, generating a new one: clients will refuse this server\n", path);
+    }
+    if (!ol_hs_server_init(&s->hs, loaded ? secret : NULL)) {
+        fprintf(stderr, "No secure random source\n");
+        exit(1);
+    }
+    if (!loaded) {
+#ifndef _WIN32
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        f = fd >= 0 ? fdopen(fd, "w") : NULL;
+#else
+        f = fopen(path, "w");
+#endif
+        if (f) {
+            hex_encode(hex, s->hs.secret, 32);
+            fwrite(hex, 1, 64, f);
+            fclose(f);
+        } else {
+            fprintf(stderr, "Cannot save the server key to %s: clients will refuse this server after a restart\n", path);
+        }
+    }
+    hex_encode(s->hs_pub_hex, s->hs.pub, 32);
+}
+
 void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip, const char *db_path) {
     memset(s, 0, sizeof(*s));
     s->player_id_seq = 1000;
@@ -1923,11 +2019,7 @@ void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip
 
     platform_init();
 
-    // Without keys nobody could connect safely, so there is nothing to fall back to.
-    if (!ol_hs_server_init(&s->hs)) {
-        fprintf(stderr, "No secure random source\n");
-        exit(1);
-    }
+    load_server_key(s, db_path ? db_path : "relay.json");
     {
         const char *sim_secret = getenv("OPENOL_SIM_SECRET");
         if (sim_secret)
@@ -1982,6 +2074,8 @@ void server_init(Server *s, uint16_t port, const char *name, const char *bind_ip
     s->next_stats_log = now + 60.0;
 
     history_push(s, "Listening on %s:%d  name='%s'", s->bind_ip, (int)s->port, s->name);
+    history_push(s, "Server key: %s", s->hs_pub_hex);
+    server_log(s, "Server key: %s", s->hs_pub_hex);
 }
 
 static void flush_players(Server *s) {
