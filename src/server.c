@@ -145,7 +145,7 @@ void server_clear_room_snapshots(Server *s, int room_idx) {
 int server_room_player_count(Server *s, int room_idx) {
     int count = 0;
     for (int i = 0; i < MAX_CLIENTS; i++)
-        if (s->players[i].used && s->players[i].room_idx == room_idx)
+        if (s->players[i].used && s->players[i].room_idx == room_idx && !s->players[i].is_sim)
             count++;
     return count;
 }
@@ -607,9 +607,24 @@ static void sim_set_owner(Server *s, int room_idx, int new_owner) {
     }
 }
 
-// Another player in the world who can take over from exclude_id, or 0.
-static int sim_next_owner(const Server *s, int room_idx, int exclude_id) {
+static void player_clear_world_snaps(Player *p);
+
+static Player *sim_node(Server *s, int room_idx) {
     int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        Player *p = &s->players[i];
+        if (p->used && p->is_sim && p->room_idx == room_idx)
+            return p;
+    }
+    return NULL;
+}
+
+// Who can take over from exclude_id: the simulator if it is in the world, else a player, or 0.
+static int sim_next_owner(Server *s, int room_idx, int exclude_id) {
+    const Player *node = sim_node(s, room_idx);
+    int i;
+    if (node && node->in_world && node->id != exclude_id)
+        return node->id;
     for (i = 0; i < MAX_CLIENTS; i++) {
         const Player *p = &s->players[i];
         if (p->used && p->room_idx == room_idx && p->in_world && p->id != exclude_id)
@@ -625,6 +640,7 @@ static int sim_next_owner(const Server *s, int room_idx, int exclude_id) {
 void server_disconnect(Server *s, Player *p) {
     int  room_idx = p->room_idx;
     int  pid      = p->id;
+    int  was_sim  = p->is_sim;
     char ip[MAX_IP];
     char nick[MAX_NICK];
     strncpy(ip,   p->ip,   sizeof(ip)   - 1); ip[sizeof(ip)-1]     = '\0';
@@ -644,7 +660,8 @@ void server_disconnect(Server *s, Player *p) {
     memset(p, 0, sizeof(*p));   // mark as free
 
     // Notify remaining players
-    send_disconnect_notify(s, room_idx, pid);
+    if (!was_sim)
+        send_disconnect_notify(s, room_idx, pid);
 
     // Updated online count
     int count = server_room_player_count(s, room_idx);
@@ -653,9 +670,15 @@ void server_disconnect(Server *s, Player *p) {
     // Clear all snapshots when the room becomes empty
     if (count == 0) {
         Room *room = &s->rooms[room_idx];
+        Player *node = sim_node(s, room_idx);
         server_clear_room_snapshots(s, room_idx);
         room->world_persist[0] = '\0';
         room->world_cp[0] = '\0';
+        // The simulator waits for the next player's world.
+        if (node) {
+            node->in_world = 0;
+            player_clear_world_snaps(node);
+        }
     }
 
     server_log(s, "[%s] ID=%d ('%s') disconnected (%d left in room)", ip, pid, nick, count);
@@ -952,7 +975,11 @@ static void session_join(Server *s, Player *pl) {
 static void session_new_world(Server *s, Player *pl, const char *cp, const char *persist) {
     Room *room = &s->rooms[pl->room_idx];
     int i;
+    Player *node = sim_node(s, pl->room_idx);
     server_clear_room_snapshots(s, pl->room_idx);
+    // A new world starts with the simulator in charge, even while it is still loading.
+    if (node)
+        sim_set_owner(s, pl->room_idx, node->id);
     strncpy(room->world_cp, cp, MAX_WORLD_NAME - 1);
     room->world_cp[MAX_WORLD_NAME - 1] = '\0';
     strncpy(room->world_persist, persist, MAX_WORLD_NAME - 1);
@@ -975,7 +1002,7 @@ static int session_others_in_world(const Server *s, const Player *pl) {
     int i, n = 0;
     for (i = 0; i < MAX_CLIENTS; i++) {
         const Player *p = &s->players[i];
-        if (p->used && p != pl && p->room_idx == pl->room_idx && p->in_world) n++;
+        if (p->used && p != pl && p->room_idx == pl->room_idx && p->in_world && !p->is_sim) n++;
     }
     return n;
 }
@@ -994,6 +1021,16 @@ static void session_enter(Server *s, Player *pl, const char *data, int len) {
     if (off < 0) return;
     off = read_world_str(data, len, off, persist);
     if (off < 0 || !persist[0]) return;
+
+    // The simulator follows the players and never changes the world for them.
+    if (pl->is_sim) {
+        if (!room->world_persist[0]) return;
+        if (epoch == room->epoch && world_name_eq(persist, room->world_persist))
+            session_join(s, pl);
+        else
+            send_world_msg(pl, SESS_TRAVEL, room);
+        return;
+    }
 
     others = session_others_in_world(s, pl);
     if (!room->world_persist[0]
@@ -1014,7 +1051,7 @@ static void session_checkpoint(Server *s, Player *pl, const char *data, int len)
     Room *room = &s->rooms[pl->room_idx];
     char cp[MAX_WORLD_NAME], persist[MAX_WORLD_NAME];
     int off = read_world_str(data, len, OL_HEADER_SIZE, cp);
-    if (off < 0 || !pl->in_world) return;
+    if (off < 0 || !pl->in_world || pl->is_sim) return;
     off = read_world_str(data, len, off, persist);
     if (off < 0 || !persist[0]) return;
 
@@ -1052,7 +1089,24 @@ static void session_leave(Server *s, Player *pl) {
     push_release_owner(s, pl->room_idx, pl->id);
     enemy_remove_all_for_player(s, pl->room_idx, pl->id);
     player_clear_world_snaps(pl);
-    notify_player_left(s, pl);
+    if (!pl->is_sim)
+        notify_player_left(s, pl);
+}
+
+static void session_sim_hello(Server *s, Player *pl) {
+    Room *room = &s->rooms[pl->room_idx];
+    Player *node = sim_node(s, pl->room_idx);
+    if (node && node != pl) {
+        server_log(s, "Room '%s' already has a simulator (ID=%d), ignoring ID=%d", room->code, node->id, pl->id);
+        return;
+    }
+    if (!pl->is_sim) {
+        pl->is_sim = 1;
+        broadcast_online_count(s, pl->room_idx, server_room_player_count(s, pl->room_idx));
+        server_log(s, "Room '%s' simulator: ID=%d", room->code, pl->id);
+    }
+    if (room->world_persist[0])
+        send_world_msg(pl, SESS_TRAVEL, room);
 }
 
 static void handle_session(Server *s, Player *pl, unsigned char ptype, const char *data, int len) {
@@ -1060,6 +1114,7 @@ static void handle_session(Server *s, Player *pl, unsigned char ptype, const cha
         case SESS_ENTER:      session_enter(s, pl, data, len); break;
         case SESS_CHECKPOINT: session_checkpoint(s, pl, data, len); break;
         case SESS_LEAVE:      session_leave(s, pl); break;
+        case SESS_SIM_HELLO:  session_sim_hello(s, pl); break;
         default: break;
     }
 }
@@ -1228,6 +1283,11 @@ static void handle_message(Server *s, Player *pl, char *data, int len) {
             handle_session(s, pl, ptype, data, len);
             return;
         }
+        // The simulator speaks only for enemies; its own hero does not exist for anyone.
+        if (pl->is_sim && channel != CH_SRV && channel != CH_ENEMY
+            && !(channel == CH_HERO && ptype == HERO_PLAYER_EVENT)
+            && !(channel == CH_WORLD && ptype == WORLD_DISCONNECT))
+            return;
         // World traffic only flows between players in the current world.
         if (channel != CH_SRV && !pl->in_world
             && !(channel == CH_WORLD && ptype == WORLD_DISCONNECT))

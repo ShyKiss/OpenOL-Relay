@@ -320,6 +320,7 @@ typedef struct {
     OlConn   conn;
     int      pending_disconnect;  // set while a datagram is being processed
     int      in_world;            // receives and sends world traffic
+    int      is_sim;              // headless simulator: runs enemy AI, players never see it
 } Player;
 
 // ---------------------------------------------------------------------------
