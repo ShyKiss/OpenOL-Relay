@@ -413,7 +413,6 @@ static void print_help(void) {
     cmd_print("    bans                          - list all bans");
     cmd_print("    stats                         - traffic, security counters, link per player");
     cmd_print("    room create <code> [password] - create room");
-    cmd_print("    stats                         - traffic, security counters, per-player link");
     cmd_print("    setpw <code> <password>       - change room password");
     cmd_print("    log on|off                    - toggle packet logging");
     cmd_print("    quit                          - shutdown server");
