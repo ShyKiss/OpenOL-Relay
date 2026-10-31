@@ -9,12 +9,15 @@
 
 TUI/GUI - Relay between [OpenOL](https://github.com/ShyKiss/OpenOL) clients — a modded client for the game Outlast.
 
-Relay is a UDP server that receives packets from OpenOL clients and forwards them to the other players in the same room. The server does not simulate the game world — it relays packets as-is and stores state snapshots so that a player who joins later sees an up-to-date location.
+Relay is the UDP server of an OpenOL game. It decides what happens to the shared world (doors, triggers, checkpoints), checks what players report, and sends the result to everyone in the room. It doesn't run the game engine: enemy AI runs on one of the players or in a separate headless simulator, chosen by the relay.
+
+To build it, see [docs/BUILD.md](./docs/BUILD.md). To run it in a container, see [docs/HOSTING.md](./docs/HOSTING.md).
 
 ## Features
 
 - **UDP server** for 128 clients and up to 64 rooms
-- **Rooms** with or without a password
+- **Encrypted traffic**, and a server key that clients remember so nobody can impersonate the server
+- **Rooms** with or without a password. Passwords aren't sent over the network, and only their hashes are stored
 - **Bans** — global and per-room, with a reason
 - **World sync** for players who join later: player, door, enemy and pickup states
 - **Door priority per player** — while one player is interacting with a door, the others get a denial (`DOOR_DENY`)
@@ -24,7 +27,7 @@ Relay is a UDP server that receives packets from OpenOL clients and forwards the
 
 ## Configuration
 
-All settings are stored in the `relay.db` file (JSON format), which is created next to the executable. Rooms, passwords, trusted IP lists and bans are kept there as well:
+All settings are stored in the `relay.db` file (JSON format), which is created next to the executable. Rooms, password hashes and bans are kept there as well:
 
 ```json
 {
@@ -45,7 +48,9 @@ All settings are stored in the `relay.db` file (JSON format), which is created n
 }
 ```
 
-The file is rewritten when settings are changed through commands/GUI and on server shutdown.
+The file is rewritten when settings are changed through commands/GUI and on server shutdown. The `trusted` list is no longer used.
+
+The server key is stored separately in `relay.db.key`. Keep this file: see [docs/HOSTING.md](./docs/HOSTING.md).
 
 ## Commands
 
@@ -63,6 +68,8 @@ Available both in the TUI and in the input field on the **Log** tab in the GUI.
 | `bans` | List all bans |
 | `room create <code> [password]` | Create a room |
 | `setpw <code> <password>` | Change a room's password |
+| `stats` | Server key, traffic, refused joins, and each player's connection |
+| `log on\|off` | Toggle packet logging |
 | `quit` | Shut down the server |
 
 ## Built with
@@ -72,3 +79,4 @@ Available both in the TUI and in the input field on the **Log** tab in the GUI.
 | [OpenOL](https://github.com/ShyKiss/OpenOL) | The modded Outlast client this Relay is made for |
 | [Dear ImGui](https://github.com/ocornut/imgui) | Graphical interface (GUI build) |
 | [SDL2](https://github.com/libsdl-org/SDL) | Window and input for the GUI build on Linux/macOS |
+| [Monocypher](https://monocypher.org) | Encryption and password hashing |

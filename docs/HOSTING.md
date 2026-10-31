@@ -24,16 +24,27 @@ podman build --no-cache -t openol-relay:latest -f Container/Containerfile .
 
 ### Running the Container
 
-Disclaimer: If you're gonna use a custom config put it into the root of this repository.
+Disclaimer: If you're gonna use a custom config, put `relay.db` into the root of this repository and uncomment the `COPY relay.db` line in the Containerfile.
 
 Run the container with:
 
 ```sh
 podman run --replace -it \
   --name openol-relay \
-  -p 7777:7777/tcp \
   -p 7777:7777/udp \
+  -v openol-relay-data:/opt/games/openol-relay/src/build \
   openol-relay:latest
+```
+
+The relay uses only UDP. It keeps `relay.db` and `relay.db.key` next to its binary, so the volume covers the whole build folder and the binary is copied onto it on first start. Mounting these two files separately doesn't work, because `relay.db` is replaced on save.
+
+After rebuilding the image, the volume still holds the old binary. Copy the new one before starting the container:
+
+```sh
+podman run --rm \
+  -v openol-relay-data:/data \
+  --entrypoint cp \
+  openol-relay:latest /opt/games/openol-relay/src/build/OpenOL_Relay /data/
 ```
 
 ### Simulator secret
@@ -54,8 +65,7 @@ versions cannot connect to this relay: the handshake changed.
 On first start the relay creates `relay.db.key` next to `relay.db` and logs `Server key: <hex>`.
 Clients remember the key per address on first connection and refuse the server if it changes, like SSH.
 
-* Keep the file and back it up. In a container, put `relay.db` and `relay.db.key` on a volume, otherwise
-  every new container is a new server to all clients.
+* Keep the file and back it up. Without the volume above, every new container is a new server to all clients.
 * To protect the first connection too, publish the key and have players add it to `OLMultiplayer.ini`
   before connecting:
   ```
